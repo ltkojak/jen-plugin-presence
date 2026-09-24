@@ -1,0 +1,228 @@
+{% extends "base.html" %}
+{% block title %}Presence{% endblock %}
+{% block content %}
+
+<div class="page-header flex items-center between wrap gap-3">
+    <div>
+        <h1>{{ icon("wifi", "ico-lg") }} Presence</h1>
+        <p>Publishes tracked devices' online/offline state to Home Assistant, MQTT, or any HTTP endpoint.</p>
+    </div>
+    {% if is_admin %}
+    <button id="pr-add-btn" class="btn btn-primary">{{ icon("plus") }} Track a device</button>
+    {% endif %}
+</div>
+
+{% if ipv6_enabled %}
+<div class="alert alert-info">{{ icon("info") }} Presence tracks IPv4-identified devices only.</div>
+{% endif %}
+
+<div class="card" style="padding:0;">
+<div class="table-wrap">
+<table class="rowlist">
+    <thead><tr>
+        <th>Device</th>
+        <th>Status</th>
+        <th>Since</th>
+        <th></th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+    <tr>
+        <td data-m="primary">
+            {{ r.label or r.mac }}
+            {% if r.label %}<span class="small muted mono">({{ r.mac }})</span>{% endif %}
+        </td>
+        <td data-m="badge">
+            {% if r.online %}<span class="ok">{{ icon("circle-check") }} Online</span>
+            {% elif r.online is none %}<span class="muted">{{ icon("circle") }} Unknown</span>
+            {% else %}<span class="bad">{{ icon("circle-x") }} Offline</span>{% endif %}
+        </td>
+        <td class="small muted" data-m="hide">{{ r.since | utcfmt if r.since else '—' }}</td>
+        <td data-m="trailing">
+            {% if is_admin %}
+            <form method="POST" action="{{ url_for('presence.untrack', mac=r.mac) }}" class="contents"
+                  data-confirm="Stop tracking {{ r.label or r.mac }}?">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="btn btn-sm btn-secondary bad" title="Untrack" aria-label="Untrack">{{ icon("trash") }}</button>
+            </form>
+            {% endif %}
+        </td>
+    </tr>
+    {% endfor %}
+    {% if not rows %}
+    <tr><td data-m="full" colspan="4" class="center muted">No devices tracked yet. {% if is_admin %}Track one above, or use "Track presence" on any Lease or Device row.{% endif %}</td></tr>
+    {% endif %}
+    </tbody>
+</table>
+</div>
+</div>
+
+{% if is_admin %}
+<div class="page-header mt-3">
+    <h2>Sinks</h2>
+</div>
+<div class="card" style="padding:0;">
+<div class="table-wrap">
+<table class="rowlist">
+    <thead><tr>
+        <th>Sink</th>
+        <th>Type</th>
+        <th></th>
+    </tr></thead>
+    <tbody>
+    {% for s in sinks %}
+    <tr>
+        <td data-m="primary">
+            {{ s.name }}
+            {% if not s.enabled %}<span class="badge">paused</span>{% endif %}
+            {% if s.last_error %}<span class="bad small" title="{{ s.last_error }}">{{ icon("triangle-alert") }}</span>{% endif %}
+        </td>
+        <td data-m="hide">{{ {'ha_webhook': 'Home Assistant webhook', 'mqtt': 'MQTT', 'http': 'Generic HTTP'}[s.kind] }}</td>
+        <td data-m="trailing">
+            <div class="flex gap-1 items-center">
+                <form method="POST" action="{{ url_for('presence.test_sink', sink_id=s.id) }}" class="contents">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-secondary" title="Send test">Send test</button>
+                </form>
+                <form method="POST" action="{{ url_for('presence.toggle_sink', sink_id=s.id) }}" class="contents">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-secondary">{{ 'Pause' if s.enabled else 'Enable' }}</button>
+                </form>
+                <form method="POST" action="{{ url_for('presence.delete_sink', sink_id=s.id) }}" class="contents"
+                      data-confirm="Remove {{ s.name }}?">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-secondary bad">{{ icon("trash") }}</button>
+                </form>
+            </div>
+        </td>
+    </tr>
+    {% endfor %}
+    {% if not sinks %}
+    <tr><td data-m="full" colspan="3" class="center muted">No sinks configured yet.</td></tr>
+    {% endif %}
+    </tbody>
+</table>
+</div>
+</div>
+<div class="mt-2">
+    <button id="pr-add-sink-btn" class="btn btn-secondary">{{ icon("plus") }} Add Sink</button>
+</div>
+{% endif %}
+
+{% if is_admin %}
+<div id="pr-add-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
+<div class="card" style="width:min(440px,94vw);max-height:90vh;overflow-y:auto;">
+    <div class="flex between items-center mb-3">
+        <h3>{{ icon("plus") }} Track a device</h3>
+        <button id="pr-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
+    </div>
+    <form method="POST" action="{{ url_for('presence.track') }}" id="pr-add-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-group">
+            <label>MAC address</label>
+            <input type="text" name="mac" id="pr-mac" list="pr-candidates" class="mono" placeholder="aa:bb:cc:dd:ee:ff" required autocomplete="off">
+            <datalist id="pr-candidates">
+                {% for c in candidates %}
+                <option value="{{ c.mac }}">{{ c.label or c.mac }}</option>
+                {% endfor %}
+            </datalist>
+        </div>
+        <div class="form-group">
+            <label>Label <span class="small muted">(optional)</span></label>
+            <input type="text" name="label" id="pr-label" maxlength="100" autocomplete="off">
+        </div>
+        <div class="form-group">
+            <label>IP <span class="small muted">(optional — used to work out the subnet)</span></label>
+            <input type="text" name="ip" id="pr-ip" class="mono" autocomplete="off">
+        </div>
+        <div class="flex gap-2 mt-3">
+            <button type="submit" class="btn btn-primary">Track</button>
+            <button type="button" id="pr-add-cancel-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+    </form>
+</div>
+</div>
+
+<div id="pr-add-sink-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
+<div class="card" style="width:min(460px,94vw);max-height:90vh;overflow-y:auto;">
+    <div class="flex between items-center mb-3">
+        <h3>{{ icon("plus") }} Add Sink</h3>
+        <button id="pr-add-sink-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
+    </div>
+    <form method="POST" action="{{ url_for('presence.add_sink') }}" id="pr-add-sink-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-group">
+            <label>Name</label>
+            <input type="text" name="name" maxlength="100" required autocomplete="off">
+        </div>
+        <div class="form-group">
+            <label>Type</label>
+            <select name="kind" id="pr-sink-kind">
+                <option value="ha_webhook">Home Assistant webhook</option>
+                <option value="mqtt">MQTT</option>
+                <option value="http">Generic HTTP</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label id="pr-url-label">URL</label>
+            <input type="text" name="url" id="pr-url" autocomplete="off" placeholder="https://ha.local:8123/api/webhook/xyz">
+        </div>
+        <div class="form-group" id="pr-credential-group">
+            <label id="pr-credential-label">Bearer token <span class="small muted">(optional)</span></label>
+            <input type="password" name="credential" autocomplete="new-password">
+            <div class="form-hint">Stored encrypted; never shown again once saved.</div>
+        </div>
+        <div class="form-group" id="pr-mqtt-fields" style="display:none;">
+            <label>Topic prefix</label>
+            <input type="text" name="topic_prefix" value="jen/presence" autocomplete="off">
+            <label class="flex items-center gap-1 mt-2"><input type="checkbox" name="retain" checked> Retain messages</label>
+            <label class="flex items-center gap-1"><input type="checkbox" name="discovery"> Send Home Assistant MQTT discovery messages</label>
+        </div>
+        <div class="flex gap-2 mt-3">
+            <button type="submit" class="btn btn-primary">Add Sink</button>
+            <button type="button" id="pr-add-sink-cancel-btn" class="btn btn-secondary">Cancel</button>
+        </div>
+    </form>
+</div>
+</div>
+{% endif %}
+
+<script nonce="{{ csp_nonce }}">
+function _prModal(id, show) {
+    document.getElementById(id).style.display = show ? 'flex' : 'none';
+}
+{% if is_admin %}
+var PR_CANDIDATES = {{ candidates|tojson }};
+document.getElementById('pr-add-btn').addEventListener('click', function() { _prModal('pr-add-modal', true); });
+document.getElementById('pr-add-close-btn').addEventListener('click', function() { _prModal('pr-add-modal', false); });
+document.getElementById('pr-add-cancel-btn').addEventListener('click', function() { _prModal('pr-add-modal', false); });
+document.getElementById('pr-add-modal').addEventListener('click', function(e) { if (e.target === this) _prModal('pr-add-modal', false); });
+document.getElementById('pr-mac').addEventListener('input', function() {
+    var match = PR_CANDIDATES.find(function(c) { return c.mac === this.value; }.bind(this));
+    if (!match) return;
+    var labelField = document.getElementById('pr-label');
+    if (!labelField.value) labelField.value = match.label || '';
+});
+
+document.getElementById('pr-add-sink-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', true); });
+document.getElementById('pr-add-sink-close-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', false); });
+document.getElementById('pr-add-sink-cancel-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', false); });
+document.getElementById('pr-add-sink-modal').addEventListener('click', function(e) { if (e.target === this) _prModal('pr-add-sink-modal', false); });
+document.getElementById('pr-sink-kind').addEventListener('change', function() {
+    var isMqtt = this.value === 'mqtt';
+    document.getElementById('pr-mqtt-fields').style.display = isMqtt ? '' : 'none';
+    document.getElementById('pr-url-label').textContent = isMqtt ? 'MQTT URL' : 'URL';
+    document.getElementById('pr-url').placeholder = isMqtt ? 'mqtt://user@host:1883' : 'https://ha.local:8123/api/webhook/xyz';
+    document.getElementById('pr-credential-label').textContent = isMqtt ? 'MQTT password (optional)' : 'Bearer token (optional)';
+});
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+        _prModal('pr-add-modal', false);
+        _prModal('pr-add-sink-modal', false);
+    }
+});
+{% endif %}
+</script>
+
+{% endblock %}

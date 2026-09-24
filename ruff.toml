@@ -1,0 +1,23 @@
+# Identical rule set and formatter settings to jen-kea's own ruff.toml,
+# on purpose: Jen bundles a byte-for-byte copy of this plugin under
+# jen-kea/plugins/<id>/ and lints its whole tree with `ruff check .` and
+# `ruff format --check .` in CI. A plugin that passes a weaker config
+# here would fail there the moment it's resynced. Keep the two files in
+# step (the comments explaining each rule live in jen-kea's copy).
+
+target-version = "py310"
+line-length = 120
+
+[lint]
+select = ["F", "E", "W", "I", "UP", "B", "SIM", "C4", "PIE", "RUF100"]
+ignore = [
+    "E501",   # line-too-long — soft target, the formatter handles it
+    "B008",   # function calls in default arguments (Flask patterns)
+    "SIM108", # if-else-block-instead-of-if-exp — readability over density
+]
+
+[lint.isort]
+known-first-party = ["jen"]
+
+[format]
+quote-style = "double"

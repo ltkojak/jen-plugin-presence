@@ -1,0 +1,28 @@
+{
+  "id": "presence",
+  "name": "Presence",
+  "version": "1.0.0",
+  "description": "Publishes tracked devices' online/offline state to Home Assistant (webhook), MQTT, or any HTTP endpoint, so the house can react to a phone joining or leaving. Opt-in per MAC — nothing is published for a device you haven't chosen to track.",
+  "author": "Matthew Thibodeau",
+  "requires_jen": "5.57.0",
+  "plugin_api": 3,
+  "tags": [
+    "network",
+    "automation",
+    "home-assistant"
+  ],
+  "changelog_url": "https://github.com/ltkojak/jen-plugin-presence/blob/main/CHANGELOG.md",
+  "nav": [
+    {
+      "section": "management",
+      "label": "Presence",
+      "icon": "wifi",
+      "endpoint": "presence.index"
+    }
+  ],
+  "db_migrations": [
+    {"version": 1, "description": "pr_tracked table", "sql": "CREATE TABLE IF NOT EXISTS pr_tracked (mac VARCHAR(17) NOT NULL PRIMARY KEY, label VARCHAR(100), subnet_id INT NULL, added_by VARCHAR(100), added_at DATETIME DEFAULT CURRENT_TIMESTAMP)"},
+    {"version": 2, "description": "pr_state table", "sql": "CREATE TABLE IF NOT EXISTS pr_state (mac VARCHAR(17) NOT NULL PRIMARY KEY, online TINYINT(1) NOT NULL DEFAULT 0, since DATETIME NULL, last_seen DATETIME NULL, misses INT NOT NULL DEFAULT 0)"},
+    {"version": 3, "description": "pr_sinks table", "sql": "CREATE TABLE IF NOT EXISTS pr_sinks (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, kind ENUM('ha_webhook','mqtt','http') NOT NULL, url VARCHAR(255) NOT NULL, credential TEXT, topic_prefix VARCHAR(100) NOT NULL DEFAULT 'jen/presence', retain TINYINT(1) NOT NULL DEFAULT 1, discovery TINYINT(1) NOT NULL DEFAULT 0, enabled TINYINT(1) NOT NULL DEFAULT 1, last_error VARCHAR(300) NULL)"}
+  ]
+}

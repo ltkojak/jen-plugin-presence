@@ -1,0 +1,7 @@
+# Everything text is LF in the working tree on every platform — plugin.zip
+# is built from the working tree, so a CRLF checkout on Windows would ship
+# CRLF files and never match what CI (a Linux checkout) rebuilds.
+* text=auto eol=lf
+*.zip binary
+*.pyc binary
+*.png binary
