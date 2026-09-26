@@ -20,7 +20,10 @@ own tree in a way that silently reaches a plugin:
     this plugin's own CI catches that before it ever reaches Jen's bundled-
     copy scan of the same thing.
 
-Exit status is non-zero on the first failure, with every failing check
+The templates also carry no inline style="" attribute (the round-4 UI rule in Jen's
+docs/ui.md): static declarations belong in the page's own <style> block, and a
+script hides or shows an element with a class or `el.style.display`, which the CSP
+allows. Exit status is non-zero on the first failure, with every failing check
 listed. Nothing here needs a database or the `jen` package.
 """
 
@@ -40,6 +43,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZIP_FLAT_FILES = ["manifest.json", "plugin.py", "README.md", "CHANGELOG.md", "LICENSE", ".enabled"]
 
 _INLINE_HANDLER_RE = re.compile(r"""\son[a-z]+\s*=\s*["']""", re.I)
+_INLINE_STYLE_RE = re.compile(r"""\sstyle\s*=\s*["']""", re.I)
 _SCRIPT_OPEN_RE = re.compile(r"<script\b[^>]*>", re.I)
 _CHANGELOG_HEAD_RE = re.compile(r"^## \[(\d+\.\d+\.\d+)\]", re.M)
 # Same pattern as Jen's own tests/test_plugin_template_csrf.py, copied here
@@ -157,6 +161,8 @@ def check_templates():
             except Exception as e:
                 fail(f"{rel}: Jinja parse error: {e}")
             for lineno, line in enumerate(src.splitlines(), 1):
+                if _INLINE_STYLE_RE.search(line):
+                    fail(f"{rel}:{lineno}: inline style attribute (use the page's <style> block): {line.strip()[:80]}")
                 if _INLINE_HANDLER_RE.search(line):
                     fail(f"{rel}:{lineno}: inline event handler (blocked by Jen's CSP): {line.strip()[:80]}")
             for sm in _SCRIPT_OPEN_RE.finditer(src):
@@ -170,7 +176,9 @@ def check_templates():
     if count == 0:
         fail("no templates found under templates/")
     elif not any(f.startswith("templates/") for f in failures):
-        ok(f"{count} template(s) parse; no inline handlers; every <script> nonce'd; every POST form has csrf_token")
+        ok(
+            f"{count} template(s) parse; no inline handlers or style attributes; every <script> nonce'd; every POST form has csrf_token"
+        )
 
 
 def check_line_endings():

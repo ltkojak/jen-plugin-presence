@@ -68,6 +68,24 @@ below only flips an online device offline after
 single missed pass never flips it early. Any sighting, from either
 signal, flips a device online at once.
 
+**Only what Jen can see from where it sits (v1.0.1).** The neighbour pass reads
+`ip -4 neigh`, which only ever holds hosts on a segment the Jen host has an
+interface on. A tracked device anywhere else was never in it, so it "missed" three
+passes and went offline fifteen minutes after joining, and stayed there (a renewal
+emits nothing). A pass now reads the host's own interface subnets first
+(`ip -4 -o addr show`); a miss counts only for a MAC that is on one of them. For
+every other device the state follows lease events alone, and the page says
+"lease-based" beside it.
+
+**Who may do what (v1.0.1).** Sinks are global integrations with a credential, and
+every transition publishes every tracked client's MAC, label, IP, hostname and state
+to every enabled sink, so configuring one (add, pause/enable, test, remove) is a
+superadmin action; other admins see the list read-only. A tracked device belongs to
+the subnet its MAC is in NOW (device, active lease, reservation), derived here — never
+a value in the request. Tracking a MAC that is already tracked authorises the existing
+row first and only ever changes its label, never its subnet. A MAC with no subnet is for
+unrestricted callers only.
+
 **One connect-publish-disconnect cycle per transition.** This plugin
 never holds an MQTT connection open — each transition opens a fresh
 TCP (optionally TLS) connection, sends CONNECT, waits for CONNACK,
@@ -164,6 +182,8 @@ def build_connect_packet(client_id, username=None, password=None, keep_alive=_MQ
         flags |= 0x80
     if password:
         flags |= 0x40
+    if password and not username:
+        raise ValueError("an MQTT password needs a user name (MQTT-3.1.2-22)")
     variable_header += bytes([flags])
     variable_header += keep_alive.to_bytes(2, "big")
 
@@ -191,20 +211,64 @@ def build_disconnect_packet():
 
 
 def parse_mqtt_url(url):
-    """Pure: 'mqtt://[user@]host[:port]' or 'mqtts://...' -> {"host",
-    "port", "use_tls", "username"} | None if malformed. Port defaults
-    to 1883 (mqtt) / 8883 (mqtts) when omitted."""
+    """Pure: 'mqtt://[user[:pass]@]host[:port]' or 'mqtts://...' -> {"host",
+    "port", "use_tls", "username", "password"} | None if malformed. Port defaults
+    to 1883 (mqtt) / 8883 (mqtts) when omitted. `.port` raises ValueError for
+    `host:abc` and `host:99999`, so it is read INSIDE the try — outside it the
+    Add Sink form answered a bad port with a 500 instead of its message."""
     try:
         parsed = urllib.parse.urlparse(url or "")
+        if parsed.scheme not in ("mqtt", "mqtts"):
+            return None
+        if not parsed.hostname:
+            return None
+        use_tls = parsed.scheme == "mqtts"
+        explicit_port = parsed.port
+        if explicit_port == 0:
+            return None
+        port = explicit_port or (8883 if use_tls else 1883)
+        return {
+            "host": parsed.hostname,
+            "port": port,
+            "use_tls": use_tls,
+            "username": parsed.username,
+            "password": parsed.password,
+        }
     except ValueError:
         return None
-    if parsed.scheme not in ("mqtt", "mqtts"):
-        return None
-    if not parsed.hostname:
-        return None
-    use_tls = parsed.scheme == "mqtts"
-    port = parsed.port or (8883 if use_tls else 1883)
-    return {"host": parsed.hostname, "port": port, "use_tls": use_tls, "username": parsed.username}
+
+
+def strip_url_password(url):
+    """Pure: 'mqtt://user:pass@host:1883' -> 'mqtt://user@host:1883'. The password
+    belongs in the encrypted credential, not in the `url` column, which is shown
+    and stored in clear. A URL without a password comes back unchanged."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.password is None:
+        return url
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = host + (f":{parsed.port}" if parsed.port else "")
+    if parsed.username:
+        netloc = f"{parsed.username}@{netloc}"
+    return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+
+
+def valid_http_url(url):
+    """Pure: an http:// or https:// URL with a host. The webhook and HTTP sinks are
+    handed to urllib, which would just as happily open file:// or ftp:// URLs."""
+    try:
+        parsed = urllib.parse.urlparse(url or "")
+        return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    except ValueError:
+        return False
+
+
+def mqtt_client_id(mac):
+    """Pure: the MQTT client identifier for a device. MQTT 3.1.1 §3.1.3.1 says a server
+    MUST accept 1-23 characters and MAY refuse more; 'jen-presence-' plus 12 hex digits
+    was 25 and some brokers do refuse it."""
+    return f"jen-pr-{mac.replace(':', '')}"
 
 
 # ── Pure: neighbour-table parsing, the offline debounce ─────────────────────────
@@ -233,6 +297,47 @@ def parse_neighbor_table(text):
         seen = state in _SEEN_STATES
         out[mac] = out.get(mac, False) or seen
     return out
+
+
+def parse_interface_networks(text):
+    """Pure: `ip -4 -o addr show` output -> [IPv4Network] of the subnets the Jen host
+    has an interface on (loopback excluded). One line looks like
+    '2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0'."""
+    nets = []
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if "inet" not in parts:
+            continue
+        i = parts.index("inet")
+        if i + 1 >= len(parts):
+            continue
+        try:
+            net = ipaddress.ip_interface(parts[i + 1]).network
+        except ValueError:
+            continue
+        if net.is_loopback:
+            continue
+        nets.append(net)
+    return nets
+
+
+def mac_is_local(ip, subnet_cidr, local_nets):
+    """Pure: is a tracked device on a segment the Jen host has an interface on, i.e. one
+    whose ARP entries `ip -4 neigh` can actually contain? Judged on the device's current
+    address when it has one, else on its subnet; a device that is neither is not local."""
+    if ip:
+        try:
+            addr = ipaddress.IPv4Address(ip)
+            return any(addr in net for net in local_nets)
+        except ValueError:
+            pass
+    if subnet_cidr:
+        try:
+            net = ipaddress.IPv4Network(subnet_cidr, strict=False)
+            return any(net.overlaps(local) for local in local_nets)
+        except ValueError:
+            return False
+    return False
 
 
 def next_presence_state(state, misses, seen, miss_threshold=_OFFLINE_MISS_THRESHOLD):
@@ -268,6 +373,7 @@ def mqtt_discovery_topic(mac):
 def mqtt_discovery_payload(mac, label, prefix):
     return {
         "state_topic": mqtt_state_topic(prefix, mac),
+        "json_attributes_topic": mqtt_attributes_topic(prefix, mac),
         "name": label or mac,
         "payload_home": "online",
         "payload_not_home": "offline",
@@ -304,10 +410,18 @@ def _get_kea_db():
     return get_kea_db()
 
 
-def _accessible_subnets():
-    from jen.plugin_api import get_accessible_subnet_map
+def _can(subnet_id):
+    """May the session user act on something in `subnet_id`? None ("no attributable
+    subnet") is for unrestricted users only — plugin_api decides (v5.65.2)."""
+    from jen.plugin_api import can_access_subnet
 
-    return get_accessible_subnet_map()
+    return can_access_subnet(subnet_id)
+
+
+def _subnet_map():
+    from jen.plugin_api import subnet_map
+
+    return subnet_map()
 
 
 def _is_admin():
@@ -329,8 +443,22 @@ def _require_write():
     return False
 
 
-def _all_subnets_user():
-    return bool(getattr(current_user, "all_subnets", False))
+def _is_superadmin():
+    try:
+        from jen.plugin_api import is_superadmin
+
+        return is_superadmin()
+    except Exception:
+        return getattr(current_user, "role", None) == "superadmin"
+
+
+def _require_superadmin():
+    """Sinks are global integrations with a credential that receive every tracked
+    client's state, so configuring one is a superadmin action (like Alerts channels)."""
+    if _is_superadmin():
+        return True
+    flash("Sinks are global integration settings: only a superadmin can change them.", "error")
+    return False
 
 
 def _audit(action, target, detail):
@@ -352,25 +480,43 @@ def _normalize_mac(raw):
     return mac if _MAC_RE.match(mac) else ""
 
 
-def _subnet_accessible(subnet_id, accessible, all_subnets):
-    if all_subnets:
-        return True
-    return subnet_id is not None and subnet_id in accessible
-
-
-def _derive_subnet_id(ip):
-    from jen.plugin_api import subnet_map
-
+def _current_subnet_for_mac(mac):
+    """The MAC's current subnet — a device's last-known placement, then an active lease, then
+    a reservation (a global reservation carries no useful subnet, so it falls through)."""
+    db = None
     try:
-        addr = ipaddress.IPv4Address(ip)
-    except ValueError:
-        return None
-    for sid, info in subnet_map().items():
-        try:
-            if addr in ipaddress.IPv4Network(info["cidr"], strict=False):
-                return sid
-        except ValueError:
-            continue
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT last_subnet_id FROM devices WHERE mac=%s", (mac,))
+            row = cur.fetchone()
+            if row and row.get("last_subnet_id") is not None:
+                return row["last_subnet_id"]
+    except Exception as e:
+        logger.warning(f"Presence: device subnet lookup failed: {e}")
+    finally:
+        if db:
+            db.close()
+    hex_mac = mac.replace(":", "").upper()
+    kdb = None
+    try:
+        kdb = _get_kea_db()
+        with kdb.cursor() as cur:
+            cur.execute("SELECT subnet_id FROM lease4 WHERE HEX(hwaddr)=%s AND state=0", (hex_mac,))
+            row = cur.fetchone()
+            if row:
+                return row["subnet_id"]
+            cur.execute(
+                "SELECT dhcp4_subnet_id AS subnet_id FROM hosts WHERE dhcp_identifier_type=0 AND HEX(dhcp_identifier)=%s",
+                (hex_mac,),
+            )
+            row = cur.fetchone()
+            if row and row["subnet_id"]:
+                return row["subnet_id"]
+    except Exception as e:
+        logger.warning(f"Presence: lease/reservation subnet lookup failed: {e}")
+    finally:
+        if kdb:
+            kdb.close()
     return None
 
 
@@ -401,8 +547,6 @@ def _current_ip_hostname(mac):
 
 
 def _candidate_hosts():
-    accessible = _accessible_subnets()
-    all_subnets = _all_subnets_user()
     out = []
     db = None
     try:
@@ -414,7 +558,7 @@ def _candidate_hosts():
                 if not mac:
                     continue
                 sid = row.get("last_subnet_id")
-                if not _subnet_accessible(sid, accessible, all_subnets):
+                if not _can(sid):
                     continue
                 out.append({"mac": mac, "label": row.get("device_name") or "", "subnet_id": sid})
     except Exception as e:
@@ -437,7 +581,7 @@ def _candidate_hosts():
                     continue
                 mac = ":".join(hex_mac[i : i + 2] for i in range(0, 12, 2)).lower()
                 sid = row.get("subnet_id")
-                if not _subnet_accessible(sid, accessible, all_subnets):
+                if not _can(sid):
                     continue
                 if any(c["mac"] == mac for c in out):
                     continue
@@ -488,6 +632,8 @@ def _mqtt_publish(mqtt_info, username, password, client_id, messages):
 
 
 def _http_post_json(url, body, bearer=None):
+    if not valid_http_url(url):
+        raise _PresenceError("sink URL must be http:// or https://")
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if bearer:
@@ -505,15 +651,21 @@ def _http_post_json(url, body, bearer=None):
         raise _PresenceError(f"HTTP {status}")
 
 
-def _send_to_sink(sink, mac, label, online, since_iso, ip, hostname):
+def _send_to_sink(sink, mac, label, online, since_iso, ip, hostname, test=False):
+    """One state message to one sink. `test=True` is the Send-test button: an HTTP sink's body
+    carries `"test": true`, and an MQTT sink gets ONE non-retained message on `<prefix>/test`
+    — no discovery, nothing on the device's real topics, so a test of a fake MAC never leaves a
+    retained entity behind in Home Assistant."""
     payload = build_sink_payload(mac, label, online, since_iso, ip, hostname)
+    if test:
+        payload["test"] = True
     if sink["kind"] in ("ha_webhook", "http"):
         bearer = None
         if sink.get("credential"):
             from jen.plugin_api import decrypt_secret
 
             bearer = decrypt_secret(sink["credential"])
-        _http_post_json(sink["url"], payload, bearer if sink["kind"] == "http" else None)
+        _http_post_json(sink["url"], payload, bearer)
         return
 
     # kind == "mqtt"
@@ -526,6 +678,16 @@ def _send_to_sink(sink, mac, label, online, since_iso, ip, hostname):
 
         password = decrypt_secret(sink["credential"])
     prefix = sink.get("topic_prefix") or "jen/presence"
+    if test:
+        client_id = mqtt_client_id(mac)
+        _mqtt_publish(
+            mqtt_info,
+            mqtt_info.get("username"),
+            password,
+            client_id,
+            [(f"{prefix}/test", json.dumps(payload).encode("utf-8"), False)],
+        )
+        return
     retain = bool(sink.get("retain"))
     state_payload = b"online" if online else b"offline"
     attrs_payload = json.dumps(payload).encode("utf-8")
@@ -536,7 +698,7 @@ def _send_to_sink(sink, mac, label, online, since_iso, ip, hostname):
     if sink.get("discovery"):
         disc_payload = json.dumps(mqtt_discovery_payload(mac, label, prefix)).encode("utf-8")
         messages.insert(0, (mqtt_discovery_topic(mac), disc_payload, True))
-    client_id = f"jen-presence-{mac.replace(':', '')}"
+    client_id = mqtt_client_id(mac)
     _mqtt_publish(mqtt_info, mqtt_info.get("username"), password, client_id, messages)
 
 
@@ -645,11 +807,32 @@ def _tracked_macs():
             db.close()
 
 
+def _recorded_online(mac):
+    """True / False for a device's recorded state, None when it has none yet."""
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT online FROM pr_state WHERE mac=%s", (mac,))
+            row = cur.fetchone()
+            return None if row is None else bool(row["online"])
+    except Exception as e:
+        logger.warning(f"Presence: could not read recorded state for {mac}: {e}")
+        return None
+    finally:
+        if db:
+            db.close()
+
+
 def _on_lease_event(event):
     mac = (event.get("mac") or "").lower()
     if not mac or mac not in _tracked_macs():
         return
     online = event.get("kind") == "lease.new"
+    # A lease.new for a device already recorded online (a renewal is reported the same way) is not a
+    # transition: publishing it again would re-send, re-audit and re-emit an unchanged state.
+    if _recorded_online(mac) is online:
+        return
     _apply_transition(mac, online)
 
 
@@ -668,6 +851,46 @@ def _ip_binary():
     return None
 
 
+def _local_networks(ip_bin):
+    """The subnets the Jen host has an interface on, or None when they cannot be read."""
+    try:
+        result = subprocess.run([ip_bin, "-4", "-o", "addr", "show"], capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        logger.warning(f"Presence: could not read the host's interface subnets: {e}")
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_interface_networks(result.stdout)
+
+
+def _tracked_subnets():
+    """{mac: subnet_id} for every tracked device."""
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT mac, subnet_id FROM pr_tracked")
+            return {r["mac"]: r["subnet_id"] for r in cur.fetchall()}
+    except Exception as e:
+        logger.error(f"Presence: could not list tracked subnets: {e}")
+        return {}
+    finally:
+        if db:
+            db.close()
+
+
+def _local_macs(tracked, local_nets):
+    """The subset of `tracked` whose ARP entries this host can see (see mac_is_local)."""
+    subnets = _tracked_subnets()
+    cidrs = {sid: info.get("cidr") for sid, info in _subnet_map().items()}
+    out = set()
+    for mac in tracked:
+        ip, _hostname = _current_ip_hostname(mac)
+        if mac_is_local(ip, cidrs.get(subnets.get(mac)), local_nets):
+            out.add(mac)
+    return out
+
+
 def _neighbor_tick():
     tracked = _tracked_macs()
     if not tracked:
@@ -675,6 +898,16 @@ def _neighbor_tick():
     ip_bin = _ip_binary()
     if not ip_bin:
         logger.warning("Presence: no 'ip' binary found — skipping this neighbour pass")
+        return
+    local_nets = _local_networks(ip_bin)
+    if not local_nets:
+        # Without the host's own subnets a miss cannot be told from "not on my segment": count none.
+        logger.warning("Presence: could not determine the host's interface subnets — skipping this neighbour pass")
+        return
+    # Only a device on a segment this host has an interface on can ever appear in its neighbour table.
+    # For every other device the state follows lease events alone.
+    tracked = _local_macs(tracked, local_nets)
+    if not tracked:
         return
     try:
         result = subprocess.run([ip_bin, "-4", "neigh", "show"], capture_output=True, text=True, timeout=10)
@@ -690,7 +923,10 @@ def _neighbor_tick():
             # `tracked` is never empty here — the early return above
             # already handles that case.
             placeholders = ",".join(["%s"] * len(tracked))
-            cur.execute(f"SELECT mac, online, misses FROM pr_state WHERE mac IN ({placeholders})", tuple(tracked))
+            cur.execute(
+                f"SELECT mac, online, misses FROM pr_state WHERE mac IN ({placeholders})",  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
+                tuple(tracked),
+            )
             states = {r["mac"]: r for r in cur.fetchall()}
     except Exception as e:
         logger.error(f"Presence: could not read state for the neighbour pass: {e}")
@@ -753,6 +989,22 @@ def _tracked_rows():
             db.close()
 
 
+def _mark_lease_based(rows):
+    """Add `lease_based` to each row: True when the device is not on a segment the Jen host has an
+    interface on, so its state follows lease events only. None (unknown) when the host's own subnets
+    cannot be read — the page then says nothing rather than guess."""
+    ip_bin = _ip_binary()
+    local_nets = _local_networks(ip_bin) if ip_bin else None
+    if not local_nets:
+        for r in rows:
+            r["lease_based"] = None
+        return rows
+    local = _local_macs({r["mac"] for r in rows}, local_nets)
+    for r in rows:
+        r["lease_based"] = r["mac"] not in local
+    return rows
+
+
 def _sink_rows():
     db = None
     try:
@@ -773,16 +1025,59 @@ def _sink_rows():
 @bp.route("/")
 @login_required
 def index():
-    accessible = _accessible_subnets()
-    all_subnets = _all_subnets_user()
-    rows = [r for r in _tracked_rows() if _subnet_accessible(r["subnet_id"], accessible, all_subnets)]
+    rows = _mark_lease_based([r for r in _tracked_rows() if _can(r["subnet_id"])])
     return render_template(
         "presence/index.html",
         rows=rows,
         sinks=_sink_rows() if _is_admin() else [],
         candidates=_candidate_hosts() if _is_admin() else [],
         is_admin=_is_admin(),
+        is_superadmin=_is_superadmin(),
     )
+
+
+def _existing_tracked(mac):
+    """The pr_tracked row for `mac`, or None."""
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT mac, subnet_id FROM pr_tracked WHERE mac=%s", (mac,))
+            return cur.fetchone()
+    finally:
+        if db:
+            db.close()
+
+
+def _track(mac, label, source):
+    """Track `mac` (or relabel it if it is already tracked). Returns a refusal message, or "".
+    The subnet is the MAC's own, worked out here. An existing row is authorised on ITS subnet first
+    and only its label is ever changed: the upsert used to overwrite `subnet_id`, so a scoped admin
+    who knew a hidden device's MAC could re-track it into their own subnet and read its state."""
+    existing = _existing_tracked(mac)
+    if existing is not None:
+        if not _can(existing["subnet_id"]):
+            return "That device is not on a subnet you can access."
+        subnet_id = existing["subnet_id"]
+    else:
+        subnet_id = _current_subnet_for_mac(mac)
+        if not _can(subnet_id):
+            return "That MAC is not on a subnet you can access."
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO pr_tracked (mac, label, subnet_id, added_by) VALUES (%s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE label=VALUES(label)",
+                (mac, label, subnet_id, current_user.username),
+            )
+        db.commit()
+        _audit("PRESENCE_TRACK", mac, f"label={label}{source}")
+    finally:
+        if db:
+            db.close()
+    return ""
 
 
 @bp.route("/track", methods=["POST"])
@@ -795,29 +1090,15 @@ def track():
         flash("Invalid MAC address.", "error")
         return redirect(url_for("presence.index"))
     label = request.form.get("label", "").strip()[:100]
-    ip = request.form.get("ip", "").strip()
-    subnet_id = _derive_subnet_id(ip) if ip else None
-    if not _subnet_accessible(subnet_id, _accessible_subnets(), _all_subnets_user()):
-        flash("That address is outside your accessible subnets.", "error")
-        return redirect(url_for("presence.index"))
-
-    db = None
     try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute(
-                "INSERT INTO pr_tracked (mac, label, subnet_id, added_by) VALUES (%s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE label=VALUES(label), subnet_id=VALUES(subnet_id)",
-                (mac, label, subnet_id, current_user.username),
-            )
-        db.commit()
-        flash(f"Now tracking {label or mac}.", "success")
-        _audit("PRESENCE_TRACK", mac, f"label={label}")
+        refusal = _track(mac, label, "")
     except Exception as e:
         flash(f"Could not track {mac}: {e}", "error")
-    finally:
-        if db:
-            db.close()
+        return redirect(url_for("presence.index"))
+    if refusal:
+        flash(refusal, "error")
+    else:
+        flash(f"Now tracking {label or mac}.", "success")
     return redirect(url_for("presence.index"))
 
 
@@ -827,6 +1108,10 @@ def untrack(mac):
     if not _require_write():
         return redirect(url_for("presence.index"))
     mac = _normalize_mac(mac)
+    row = _existing_tracked(mac) if mac else None
+    if row is None or not _can(row["subnet_id"]):
+        flash("Device not found.", "error")
+        return redirect(url_for("presence.index"))
     db = None
     try:
         db = _get_db()
@@ -857,31 +1142,16 @@ def track_from_row():
         flash("Invalid MAC address.", "error")
         return redirect(url_for("presence.index"))
     hostname = request.args.get("hostname", "").strip()[:100]
+    # a `subnet_id` in the query string is ignored: the subnet is worked out from the MAC
     try:
-        subnet_id = int(request.args.get("subnet_id", ""))
-    except (TypeError, ValueError):
-        subnet_id = None
-    if not _subnet_accessible(subnet_id, _accessible_subnets(), _all_subnets_user()):
-        flash("That address is outside your accessible subnets.", "error")
-        return redirect(url_for("presence.index"))
-
-    db = None
-    try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute(
-                "INSERT INTO pr_tracked (mac, label, subnet_id, added_by) VALUES (%s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE label=VALUES(label)",
-                (mac, hostname, subnet_id, current_user.username),
-            )
-        db.commit()
-        flash(f"Now tracking {hostname or mac}.", "success")
-        _audit("PRESENCE_TRACK", mac, f"label={hostname} source=row")
+        refusal = _track(mac, hostname, " source=row")
     except Exception as e:
         flash(f"Could not track {mac}: {e}", "error")
-    finally:
-        if db:
-            db.close()
+        return redirect(url_for("presence.index"))
+    if refusal:
+        flash(refusal, "error")
+    else:
+        flash(f"Now tracking {hostname or mac}.", "success")
     return redirect(url_for("presence.index"))
 
 
@@ -891,7 +1161,7 @@ def track_from_row():
 @bp.route("/sinks/add", methods=["POST"])
 @login_required
 def add_sink():
-    if not _require_write():
+    if not _require_superadmin():
         return redirect(url_for("presence.index"))
     name = request.form.get("name", "").strip()[:100]
     kind = request.form.get("kind", "")
@@ -902,13 +1172,25 @@ def add_sink():
     if not url:
         flash("URL is required.", "error")
         return redirect(url_for("presence.index"))
-    if kind == "mqtt" and not parse_mqtt_url(url):
-        flash("MQTT URL must look like mqtt://host:1883 or mqtts://host:8883.", "error")
+    credential_raw = request.form.get("credential", "")
+    if kind == "mqtt":
+        info = parse_mqtt_url(url)
+        if not info:
+            flash("MQTT URL must look like mqtt://host:1883 or mqtts://host:8883 (a port from 1 to 65535).", "error")
+            return redirect(url_for("presence.index"))
+        if info.get("password"):
+            # a password typed into the URL belongs in the encrypted credential, not in the stored URL
+            credential_raw = credential_raw or info["password"]
+            url = strip_url_password(url)
+        if credential_raw and not info.get("username"):
+            flash("An MQTT password needs a user name: use mqtt://user@host:1883.", "error")
+            return redirect(url_for("presence.index"))
+    elif not valid_http_url(url):
+        flash("URL must start with http:// or https://.", "error")
         return redirect(url_for("presence.index"))
     topic_prefix = request.form.get("topic_prefix", "jen/presence").strip()[:100] or "jen/presence"
     retain = 1 if request.form.get("retain") else 0
     discovery = 1 if request.form.get("discovery") else 0
-    credential_raw = request.form.get("credential", "")
     credential = ""
     if credential_raw:
         from jen.plugin_api import encrypt_secret
@@ -938,7 +1220,7 @@ def add_sink():
 @bp.route("/sinks/<int:sink_id>/toggle", methods=["POST"])
 @login_required
 def toggle_sink(sink_id):
-    if not _require_write():
+    if not _require_superadmin():
         return redirect(url_for("presence.index"))
     db = None
     try:
@@ -964,7 +1246,7 @@ def toggle_sink(sink_id):
 @bp.route("/sinks/<int:sink_id>/delete", methods=["POST"])
 @login_required
 def delete_sink(sink_id):
-    if not _require_write():
+    if not _require_superadmin():
         return redirect(url_for("presence.index"))
     db = None
     try:
@@ -985,7 +1267,7 @@ def delete_sink(sink_id):
 @bp.route("/sinks/<int:sink_id>/test", methods=["POST"])
 @login_required
 def test_sink(sink_id):
-    if not _require_write():
+    if not _require_superadmin():
         return redirect(url_for("presence.index"))
     db = None
     try:
@@ -1004,7 +1286,14 @@ def test_sink(sink_id):
         return redirect(url_for("presence.index"))
     try:
         _send_to_sink(
-            sink, "aa:bb:cc:dd:ee:ff", "Test device", True, datetime.now(timezone.utc).isoformat(), None, None
+            sink,
+            "aa:bb:cc:dd:ee:ff",
+            "Test device",
+            True,
+            datetime.now(timezone.utc).isoformat(),
+            None,
+            None,
+            test=True,
         )
         flash(f"Test message sent to {sink['name']}.", "success")
     except Exception as e:
@@ -1024,7 +1313,7 @@ def register(app):
             surface,
             label="Track presence",
             icon="wifi",
-            href="/management/presence/track-row?mac={mac}&subnet_id={subnet_id}&hostname={hostname}",
+            href="/management/presence/track-row?mac={mac}&hostname={hostname}",
             method="POST",
         )
 

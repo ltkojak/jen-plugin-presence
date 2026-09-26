@@ -6,7 +6,7 @@ Publishes tracked devices' online/offline state to [Home Assistant](https://www.
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.57.0 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.65.2 or later
 
 ## How a device is judged online or offline
 
@@ -14,6 +14,8 @@ Two signals feed one state per tracked device:
 
 - **Lease events** (`lease.new` / `lease.expired`) — Kea has already decided the device is there or gone, so these apply immediately, no delay.
 - **A periodic pass** over `ip -4 neigh show` (the same table [Network Discovery](https://github.com/ltkojak/jen-plugin-network-discovery) reads), every 5 minutes — Jen's own floor for any plugin's periodic job. A device counts as *seen* on a pass only when its neighbour entry is `REACHABLE`, `DELAY`, or `PROBE` (actively confirmed, or being actively reconfirmed); anything else, including a `STALE` entry, does not. Any single sighting flips a device online at once; going *offline* needs **three consecutive** passes with no sighting, so one missed ARP probe cycle never flips a device early.
+
+**A limitation to know about:** `ip -4 neigh` only ever holds hosts on a segment the Jen host has an interface on. Each pass therefore reads the host's own interface subnets (`ip -4 -o addr show`) and counts a miss only for a tracked device on one of them. A device anywhere else (behind a router, on a VLAN Jen has no interface in) is **lease-based**: it is online from its lease and offline when the lease expires, never from a probe, and the page says "lease-based" beside its state. If the host's own subnets cannot be read, the pass counts nothing.
 
 ## Sinks
 
@@ -29,10 +31,10 @@ Every sink send has a 10-second timeout; a failure records `last_error` on the s
 
 - **Track** row action on Lease and Device rows, plus a picker (over reservations and leases) on the Presence page itself
 - Respects Jen's subnet access control on both the tracked-device list and the picker
-- **Send test** on any sink, to confirm credentials and connectivity without waiting for a real transition
+- **Send test** on any sink, to confirm credentials and connectivity without waiting for a real transition (one non-retained message on `<prefix>/test`, or an HTTP body marked `"test": true`; nothing durable)
 - Credentials (an MQTT password, or an HTTP bearer token) are stored encrypted and never shown again once saved
 
-Adding, removing, and tracking a device, and managing sinks, all need admin — viewers are read-only.
+Adding, removing, and tracking a device need admin — viewers are read-only. **Sinks are superadmin-only**: every transition publishes every tracked device's MAC, label, IP, hostname and state to every enabled sink, so adding, pausing, testing or removing one is a global integration change, like an Alerts channel (other admins see the list read-only). A tracked device belongs to the subnet its MAC is in (worked out server-side, never from a value in the request), and re-tracking an existing device can only change its label.
 
 ## Installation
 
@@ -42,7 +44,7 @@ To install by hand instead (a checkout without registry access), unzip `plugin.z
 
 ## Development
 
-`python3 tools/verify.py --build` rebuilds `plugin.zip` deterministically from the tree and runs the same checks CI runs on every push and tag: the zip matches the tree byte-for-byte, no template carries an inline event handler, an un-nonce'd `<script>`, or a POST form missing `csrf_token`, `manifest.json`'s version matches the top `CHANGELOG.md` entry, and `plugin.py` compiles and passes ruff. The committed `plugin.zip` is the artifact Jen installs, so rebuild it in the same commit as any change.
+`python3 tools/verify.py --build` rebuilds `plugin.zip` deterministically from the tree and runs the same checks CI runs on every push and tag: the zip matches the tree byte-for-byte, no template carries an inline event handler, an inline `style=` attribute, an un-nonce'd `<script>`, or a POST form missing `csrf_token`, `manifest.json`'s version matches the top `CHANGELOG.md` entry, and `plugin.py` compiles and passes ruff. The committed `plugin.zip` is the artifact Jen installs, so rebuild it in the same commit as any change.
 
 `python3 tools/test_plugin.py` exercises every pure function — the MQTT packet encoder (checked byte-range by byte-range against the OASIS MQTT 3.1.1 spec, for CONNECT with and without a username/password, PUBLISH, and DISCONNECT), MQTT URL parsing, the neighbour-table parser, the offline-debounce state machine, and every sink payload/topic builder — plus calls `register(app)` end to end against a stub `jen.plugin_api`, no Jen, database, or network access needed.
 

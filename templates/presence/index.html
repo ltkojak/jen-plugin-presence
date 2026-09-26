@@ -2,6 +2,17 @@
 {% block title %}Presence{% endblock %}
 {% block content %}
 
+<style>
+/* static declarations live here, not in inline style attributes (docs/ui.md); a plugin page has no
+   shared stylesheet hook, so the page carries its own block */
+.pr-card-flush{padding:0}
+.pr-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center}
+.pr-dialog{overflow-y:auto;max-height:90vh}
+.pr-dialog-track{width:min(440px,94vw)}
+.pr-dialog-sink{width:min(460px,94vw)}
+.pr-hidden{display:none}
+</style>
+
 <div class="page-header flex items-center between wrap gap-3">
     <div>
         <h1>{{ icon("wifi", "ico-lg") }} Presence</h1>
@@ -16,7 +27,7 @@
 <div class="alert alert-info">{{ icon("info") }} Presence tracks IPv4-identified devices only.</div>
 {% endif %}
 
-<div class="card" style="padding:0;">
+<div class="card pr-card-flush">
 <div class="table-wrap">
 <table class="rowlist">
     <thead><tr>
@@ -36,6 +47,7 @@
             {% if r.online %}<span class="ok">{{ icon("circle-check") }} Online</span>
             {% elif r.online is none %}<span class="muted">{{ icon("circle") }} Unknown</span>
             {% else %}<span class="bad">{{ icon("circle-x") }} Offline</span>{% endif %}
+            {% if r.lease_based %}<span class="small muted" title="This device is not on a segment the Jen host is attached to, so its state follows DHCP lease events only.">lease-based</span>{% endif %}
         </td>
         <td class="small muted" data-m="hide">{{ r.since | utcfmt if r.since else '—' }}</td>
         <td data-m="trailing">
@@ -61,7 +73,7 @@
 <div class="page-header mt-3">
     <h2>Sinks</h2>
 </div>
-<div class="card" style="padding:0;">
+<div class="card pr-card-flush">
 <div class="table-wrap">
 <table class="rowlist">
     <thead><tr>
@@ -79,6 +91,7 @@
         </td>
         <td data-m="hide">{{ {'ha_webhook': 'Home Assistant webhook', 'mqtt': 'MQTT', 'http': 'Generic HTTP'}[s.kind] }}</td>
         <td data-m="trailing">
+            {% if is_superadmin %}
             <div class="flex gap-1 items-center">
                 <form method="POST" action="{{ url_for('presence.test_sink', sink_id=s.id) }}" class="contents">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -94,6 +107,7 @@
                     <button type="submit" class="btn btn-sm btn-secondary bad">{{ icon("trash") }}</button>
                 </form>
             </div>
+            {% endif %}
         </td>
     </tr>
     {% endfor %}
@@ -104,14 +118,18 @@
 </table>
 </div>
 </div>
+{% if is_superadmin %}
 <div class="mt-2">
     <button id="pr-add-sink-btn" class="btn btn-secondary">{{ icon("plus") }} Add Sink</button>
 </div>
+{% else %}
+<p class="small muted mt-2">Sinks receive every tracked device's state, so only a superadmin can add, change or remove one.</p>
+{% endif %}
 {% endif %}
 
 {% if is_admin %}
-<div id="pr-add-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
-<div class="card" style="width:min(440px,94vw);max-height:90vh;overflow-y:auto;">
+<div id="pr-add-modal" class="pr-modal">
+<div class="card pr-dialog pr-dialog-track">
     <div class="flex between items-center mb-3">
         <h3>{{ icon("plus") }} Track a device</h3>
         <button id="pr-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
@@ -131,10 +149,6 @@
             <label>Label <span class="small muted">(optional)</span></label>
             <input type="text" name="label" id="pr-label" maxlength="100" autocomplete="off">
         </div>
-        <div class="form-group">
-            <label>IP <span class="small muted">(optional — used to work out the subnet)</span></label>
-            <input type="text" name="ip" id="pr-ip" class="mono" autocomplete="off">
-        </div>
         <div class="flex gap-2 mt-3">
             <button type="submit" class="btn btn-primary">Track</button>
             <button type="button" id="pr-add-cancel-btn" class="btn btn-secondary">Cancel</button>
@@ -143,8 +157,10 @@
 </div>
 </div>
 
-<div id="pr-add-sink-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;align-items:center;justify-content:center;">
-<div class="card" style="width:min(460px,94vw);max-height:90vh;overflow-y:auto;">
+{% endif %}
+{% if is_superadmin %}
+<div id="pr-add-sink-modal" class="pr-modal">
+<div class="card pr-dialog pr-dialog-sink">
     <div class="flex between items-center mb-3">
         <h3>{{ icon("plus") }} Add Sink</h3>
         <button id="pr-add-sink-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
@@ -166,13 +182,14 @@
         <div class="form-group">
             <label id="pr-url-label">URL</label>
             <input type="text" name="url" id="pr-url" autocomplete="off" placeholder="https://ha.local:8123/api/webhook/xyz">
+            <div class="form-hint" id="pr-url-hint">http:// or https://. An MQTT password needs a user name in the URL (mqtt://user@host:1883); a password typed into the URL is moved to the encrypted credential.</div>
         </div>
         <div class="form-group" id="pr-credential-group">
             <label id="pr-credential-label">Bearer token <span class="small muted">(optional)</span></label>
             <input type="password" name="credential" autocomplete="new-password">
             <div class="form-hint">Stored encrypted; never shown again once saved.</div>
         </div>
-        <div class="form-group" id="pr-mqtt-fields" style="display:none;">
+        <div class="form-group pr-hidden" id="pr-mqtt-fields">
             <label>Topic prefix</label>
             <input type="text" name="topic_prefix" value="jen/presence" autocomplete="off">
             <label class="flex items-center gap-1 mt-2"><input type="checkbox" name="retain" checked> Retain messages</label>
@@ -204,22 +221,26 @@ document.getElementById('pr-mac').addEventListener('input', function() {
     if (!labelField.value) labelField.value = match.label || '';
 });
 
+{% endif %}
+{% if is_superadmin %}
 document.getElementById('pr-add-sink-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', true); });
 document.getElementById('pr-add-sink-close-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', false); });
 document.getElementById('pr-add-sink-cancel-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', false); });
 document.getElementById('pr-add-sink-modal').addEventListener('click', function(e) { if (e.target === this) _prModal('pr-add-sink-modal', false); });
 document.getElementById('pr-sink-kind').addEventListener('change', function() {
     var isMqtt = this.value === 'mqtt';
-    document.getElementById('pr-mqtt-fields').style.display = isMqtt ? '' : 'none';
+    document.getElementById('pr-mqtt-fields').classList.toggle('pr-hidden', !isMqtt);
     document.getElementById('pr-url-label').textContent = isMqtt ? 'MQTT URL' : 'URL';
     document.getElementById('pr-url').placeholder = isMqtt ? 'mqtt://user@host:1883' : 'https://ha.local:8123/api/webhook/xyz';
     document.getElementById('pr-credential-label').textContent = isMqtt ? 'MQTT password (optional)' : 'Bearer token (optional)';
 });
 
+{% endif %}
+{% if is_admin %}
 document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') {
         _prModal('pr-add-modal', false);
-        _prModal('pr-add-sink-modal', false);
+        {% if is_superadmin %}_prModal('pr-add-sink-modal', false);{% endif %}
     }
 });
 {% endif %}

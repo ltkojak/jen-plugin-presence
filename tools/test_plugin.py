@@ -161,12 +161,12 @@ def main():
     # ── MQTT URL parsing ───────────────────────────────────────────────────────
     check(
         p.parse_mqtt_url("mqtt://mosquitto.local:1883")
-        == {"host": "mosquitto.local", "port": 1883, "use_tls": False, "username": None},
+        == {"host": "mosquitto.local", "port": 1883, "use_tls": False, "username": None, "password": None},
         "parse_mqtt_url: plain mqtt:// with an explicit port",
     )
     check(
         p.parse_mqtt_url("mqtts://mqtt.example.com")
-        == {"host": "mqtt.example.com", "port": 8883, "use_tls": True, "username": None},
+        == {"host": "mqtt.example.com", "port": 8883, "use_tls": True, "username": None, "password": None},
         "parse_mqtt_url: mqtts:// defaults to port 8883",
     )
     check(
@@ -287,6 +287,379 @@ def main():
         check(gated, f"{fn.__name__} refuses a viewer before touching the request")
     p.current_user.role = "admin"
     check(p._is_admin() is True, "admin role restored for the rest of the run")
+
+    # ── 1.0.1: parse_mqtt_url — a bad port is a refusal, not a 500 ───────────
+    for bad in ("mqtt://host:abc", "mqtt://host:99999", "mqtt://host:0", "mqtts://host:-1"):
+        try:
+            got = p.parse_mqtt_url(bad)
+            raised = False
+        except Exception:
+            got, raised = "raised", True
+        check(got is None and not raised, f"parse_mqtt_url: {bad!r} returns None instead of raising")
+    check(p.parse_mqtt_url("mqtt://host:65535")["port"] == 65535, "parse_mqtt_url: the largest valid port")
+    check(
+        p.parse_mqtt_url("mqtt://bob:s3cret@host")["password"] == "s3cret",
+        "parse_mqtt_url: a password in the URL is returned",
+    )
+    check(
+        p.strip_url_password("mqtt://bob:s3cret@host:1883/x") == "mqtt://bob@host:1883/x",
+        "strip_url_password: the password leaves the URL, the user name stays",
+    )
+    check(
+        p.strip_url_password("mqtt://bob@host") == "mqtt://bob@host",
+        "strip_url_password: a URL without a password is unchanged",
+    )
+    check(
+        p.strip_url_password("mqtts://:pw@host") == "mqtts://host",
+        "strip_url_password: a password with no user name leaves a bare host",
+    )
+
+    # ── 1.0.1: URL schemes and the MQTT credential pair ──────────────────────
+    check(p.valid_http_url("https://ha.local:8123/api/webhook/x") is True, "valid_http_url: https is accepted")
+    check(p.valid_http_url("http://10.0.0.5/hook") is True, "valid_http_url: http is accepted")
+    for bad in ("file:///etc/passwd", "ftp://host/x", "javascript:alert(1)", "//host/x", "http://", ""):
+        check(p.valid_http_url(bad) is False, f"valid_http_url: {bad!r} is refused")
+    try:
+        p.build_connect_packet("jen", username=None, password="pw")
+        refused = False
+    except ValueError:
+        refused = True
+    check(
+        refused,
+        "build_connect_packet: a password without a user name is refused (MQTT-3.1.2-22), not sent with the flag unset",
+    )
+    check(
+        len(p.mqtt_client_id("aa:bb:cc:dd:ee:ff")) <= 23,
+        "mqtt_client_id: within the 23 characters every broker must accept",
+    )
+    check(
+        p.mqtt_client_id("aa:bb:cc:dd:ee:ff") == "jen-pr-aabbccddeeff",
+        "mqtt_client_id: stable and derived from the MAC",
+    )
+    disc = p.mqtt_discovery_payload("aa:bb:cc:dd:ee:ff", "Phone", "jen/presence")
+    check(
+        disc["json_attributes_topic"] == p.mqtt_attributes_topic("jen/presence", "aa:bb:cc:dd:ee:ff"),
+        "mqtt_discovery_payload: json_attributes_topic points at the attributes topic",
+    )
+
+    # ── 1.0.1: which devices can the neighbour table see at all ──────────────
+    ip_addr_out = (
+        "1: lo    inet 127.0.0.1/8 scope host lo\n"
+        "2: eth0    inet 10.1.0.5/24 brd 10.1.0.255 scope global eth0\n"
+        "3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\n"
+        "4: eth1    inet6 fe80::1/64 scope link\n"
+    )
+    nets = p.parse_interface_networks(ip_addr_out)
+    check(
+        [str(n) for n in nets] == ["10.1.0.0/24", "172.17.0.0/16"],
+        f"parse_interface_networks: the host's own IPv4 subnets, loopback and v6 skipped (got {[str(n) for n in nets]})",
+    )
+    check(
+        p.parse_interface_networks("") == [] and p.parse_interface_networks("garbage") == [],
+        "parse_interface_networks: nothing parseable is an empty list",
+    )
+    check(p.mac_is_local("10.1.0.77", None, nets) is True, "mac_is_local: an address on an interface subnet is local")
+    check(
+        p.mac_is_local("10.2.0.77", "10.1.0.0/24", nets) is False,
+        "mac_is_local: a current address elsewhere wins over a stale stored subnet",
+    )
+    check(
+        p.mac_is_local(None, "10.1.0.0/24", nets) is True, "mac_is_local: with no address, the device's subnet decides"
+    )
+    check(
+        p.mac_is_local(None, "10.2.0.0/24", nets) is False,
+        "mac_is_local: a subnet the host has no interface on is not local",
+    )
+    check(p.mac_is_local(None, None, nets) is False, "mac_is_local: nothing known is not local")
+
+    # ── a fake database and request, to run the impure routes ────────────────
+    class FakeDB:
+        def __init__(self, selects=None):
+            self.statements = []
+            self.selects = list(selects or [])
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql.split()[0].upper(), sql, params))
+
+        def fetchone(self):
+            return self.selects.pop(0) if self.selects else None
+
+        def fetchall(self):
+            return self.selects.pop(0) if self.selects else []
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+        def kinds(self):
+            return [s[0] for s in self.statements]
+
+    only_one = lambda sid: sid == 1  # noqa: E731 - a subnet-restricted caller: subnet 1; None is not theirs
+    everything = lambda sid: True  # noqa: E731 - an unrestricted caller
+    flashed = []
+    p.flash = lambda msg, cat="message": flashed.append(msg)
+    p.redirect = lambda where: "redirect"
+    p.url_for = lambda *a, **k: "/x"
+    p._require_write = lambda: True
+    mac_subnet = {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}
+    p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
+
+    # ── 1.0.1: sinks are superadmin-only, on every sink route ────────────────
+    p.current_user.role = "admin"
+    p.request = types.SimpleNamespace(form={"name": "x", "kind": "http", "url": "http://192.0.2.1/x"}, args={})
+    p._get_db = lambda: (_ for _ in ()).throw(AssertionError("the database was touched"))
+    for fn, args in ((p.add_sink, ()), (p.toggle_sink, (1,)), (p.delete_sink, (1,)), (p.test_sink, (1,))):
+        flashed.clear()
+        check(
+            fn(*args) == "redirect" and flashed and "superadmin" in flashed[-1],
+            f"{fn.__name__}: an admin who is not a superadmin is refused before any database access",
+        )
+    p.current_user.role = "superadmin"
+    check(p._is_superadmin() is True, "a superadmin passes the sink gate")
+    p.current_user.role = "admin"
+
+    # ── 1.0.1: adding a sink validates URL, scheme and the credential pair ───
+    p.current_user.role = "superadmin"
+    cases = (
+        ("an http sink with a file:// URL", {"name": "x", "kind": "http", "url": "file:///etc/passwd"}, False),
+        ("an MQTT sink with a bad port", {"name": "x", "kind": "mqtt", "url": "mqtt://host:abc"}, False),
+        (
+            "an MQTT password with no user name",
+            {"name": "x", "kind": "mqtt", "url": "mqtt://host:1883", "credential": "pw"},
+            False,
+        ),
+        ("an MQTT URL password with no user name", {"name": "x", "kind": "mqtt", "url": "mqtt://:pw@host:1883"}, False),
+        ("a good webhook", {"name": "x", "kind": "ha_webhook", "url": "https://ha.local/api/webhook/x"}, True),
+        ("a good MQTT sink", {"name": "x", "kind": "mqtt", "url": "mqtt://bob@host:1883", "credential": "pw"}, True),
+    )
+    jen_api = types.ModuleType("jen.plugin_api")
+    jen_api.encrypt_secret = lambda s: "enc:" + s
+    sys.modules["jen"] = types.ModuleType("jen")
+    sys.modules["jen.plugin_api"] = jen_api
+    sys.modules["jen"].plugin_api = jen_api
+    for label, form, should_store in cases:
+        fdb = FakeDB()
+        p._get_db = lambda fdb=fdb: fdb
+        p.request = types.SimpleNamespace(form=form, args={})
+        p.add_sink()
+        check(
+            ("INSERT" in fdb.kinds()) == should_store,
+            f"add_sink: {label} is {'stored' if should_store else 'refused, nothing stored'}",
+        )
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    p.request = types.SimpleNamespace(form={"name": "x", "kind": "mqtt", "url": "mqtt://bob:s3cret@host:1883"}, args={})
+    p.add_sink()
+    stored = [s for s in fdb.statements if s[0] == "INSERT"][0][2]
+    check(
+        stored[2] == "mqtt://bob@host:1883" and stored[3] == "enc:s3cret",
+        f"add_sink: a password typed into the URL is moved to the encrypted credential (got url={stored[2]!r}, credential={stored[3]!r})",
+    )
+    p.current_user.role = "admin"
+
+    # ── 1.0.1: tracking takes the subnet from the MAC and authorises the existing row ─
+    p._can = only_one
+    for label, mac, existing in (
+        ("a MAC in subnet 2", "aa:bb:cc:dd:ee:02", None),
+        ("a MAC Jen has never seen", "aa:bb:cc:dd:ee:99", None),
+        (
+            "a MAC already tracked in subnet 2 (a hidden device), whose current subnet is now subnet 1",
+            "aa:bb:cc:dd:ee:01",
+            {"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2},
+        ),
+    ):
+        fdb = FakeDB([existing])
+        p._get_db = lambda fdb=fdb: fdb
+        p.request = types.SimpleNamespace(form={"mac": mac, "label": "hijack", "ip": "10.1.0.5"}, args={})
+        p.track()
+        check("INSERT" not in fdb.kinds(), f"track: {label} is refused, nothing written")
+    fdb = FakeDB([None])
+    p._get_db = lambda: fdb
+    p.request = types.SimpleNamespace(form={"mac": "aa:bb:cc:dd:ee:01", "label": "Phone", "ip": "10.2.0.5"}, args={})
+    p.track()
+    ins = [s for s in fdb.statements if s[0] == "INSERT"]
+    check(
+        len(ins) == 1 and ins[0][2][2] == 1,
+        "track: a new device is stored on the MAC's own subnet (1), whatever address was typed",
+    )
+    check(
+        "subnet_id=VALUES" not in ins[0][1], "track: the upsert can only change the label — it never rewrites subnet_id"
+    )
+    fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 1}])
+    p._get_db = lambda: fdb
+    p.track()
+    ins = [s for s in fdb.statements if s[0] == "INSERT"]
+    check(
+        len(ins) == 1 and ins[0][2][2] == 1, "track: re-tracking an accessible device keeps its subnet and relabels it"
+    )
+
+    # ── 1.0.1: track-row ignores the query-string subnet ─────────────────────
+    fdb = FakeDB([None])
+    p._get_db = lambda: fdb
+    p.request = types.SimpleNamespace(
+        form={}, args={"mac": "aa:bb:cc:dd:ee:02", "subnet_id": "1", "hostname": "hijack"}
+    )
+    p.track_from_row()
+    check(
+        "INSERT" not in fdb.kinds(),
+        "track_from_row: a MAC in subnet 2 is refused even though the query string names subnet 1",
+    )
+    fdb = FakeDB([None])
+    p._get_db = lambda: fdb
+    p.request = types.SimpleNamespace(form={}, args={"mac": "aa:bb:cc:dd:ee:01", "subnet_id": "2", "hostname": "Phone"})
+    p.track_from_row()
+    ins = [s for s in fdb.statements if s[0] == "INSERT"]
+    check(
+        len(ins) == 1 and ins[0][2][2] == 1,
+        "track_from_row: the stored subnet is the MAC's own (1), not the one in the URL (2)",
+    )
+
+    # ── 1.0.1: untrack is judged on the row ──────────────────────────────────
+    for label, row, can, deleted in (
+        (
+            "a device in subnet 2, for a caller scoped to subnet 1",
+            {"mac": "aa:bb:cc:dd:ee:02", "subnet_id": 2},
+            only_one,
+            False,
+        ),
+        (
+            "a device with no subnet, for a scoped caller",
+            {"mac": "aa:bb:cc:dd:ee:02", "subnet_id": None},
+            only_one,
+            False,
+        ),
+        ("a device in the caller's own subnet", {"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 1}, only_one, True),
+        (
+            "a device with no subnet, for an unrestricted caller",
+            {"mac": "aa:bb:cc:dd:ee:02", "subnet_id": None},
+            everything,
+            True,
+        ),
+    ):
+        fdb = FakeDB([row])
+        p._get_db = lambda fdb=fdb: fdb
+        p._can = can
+        p.untrack(row["mac"])
+        check(("DELETE" in fdb.kinds()) == deleted, f"untrack: {label} is {'removed' if deleted else 'not removed'}")
+
+    # ── 1.0.1: a renewal is not a transition ─────────────────────────────────
+    applied = []
+    p._apply_transition = lambda mac, online: applied.append((mac, online))
+    p._tracked_macs = lambda: {"aa:bb:cc:dd:ee:01"}
+    for recorded, kind, expect in (
+        (True, "lease.new", []),
+        (False, "lease.new", [("aa:bb:cc:dd:ee:01", True)]),
+        (None, "lease.new", [("aa:bb:cc:dd:ee:01", True)]),
+        (False, "lease.expired", []),
+        (True, "lease.expired", [("aa:bb:cc:dd:ee:01", False)]),
+    ):
+        applied.clear()
+        p._recorded_online = lambda mac, recorded=recorded: recorded
+        p._on_lease_event({"mac": "AA:BB:CC:DD:EE:01", "kind": kind})
+        check(applied == expect, f"_on_lease_event: {kind} for a device recorded {recorded} -> {expect}")
+
+    # ── 1.0.1: the test button publishes nothing durable ─────────────────────
+    published = []
+    p._mqtt_publish = lambda info, user, pw, cid, messages: published.append((cid, messages))
+    sink = {
+        "kind": "mqtt",
+        "url": "mqtt://bob@host:1883",
+        "credential": None,
+        "topic_prefix": "jen/presence",
+        "retain": 1,
+        "discovery": 1,
+    }
+    p._send_to_sink(sink, "aa:bb:cc:dd:ee:ff", "Test device", True, "2026-09-25T00:00:00+00:00", None, None, test=True)
+    cid, messages = published[0]
+    check(
+        len(messages) == 1 and messages[0][0] == "jen/presence/test" and messages[0][2] is False,
+        f"_send_to_sink(test): ONE non-retained message on <prefix>/test, no discovery, nothing on the device topics (got {[(m[0], m[2]) for m in messages]})",
+    )
+    check(len(cid) <= 23, "_send_to_sink(test): the client id fits 23 characters")
+    published.clear()
+    p._send_to_sink(sink, "aa:bb:cc:dd:ee:ff", "Phone", True, "2026-09-25T00:00:00+00:00", None, None)
+    topics = [m[0] for m in published[0][1]]
+    check(
+        topics[0].startswith("homeassistant/device_tracker/") and len(topics) == 3,
+        f"_send_to_sink: a real transition still publishes discovery + state + attributes (got {topics})",
+    )
+    posted = []
+    p._http_post_json = lambda url, body, bearer=None: posted.append((url, body, bearer))
+    jen_api.decrypt_secret = lambda s: "token"
+    p._send_to_sink(
+        {"kind": "ha_webhook", "url": "https://ha/x", "credential": "enc"},
+        "aa:bb:cc:dd:ee:ff",
+        "T",
+        True,
+        "s",
+        None,
+        None,
+        test=True,
+    )
+    check(
+        posted[0][2] == "token" and posted[0][1].get("test") is True,
+        "_send_to_sink: a webhook sink now sends its bearer token, and a test body is marked test",
+    )
+
+    # ── 1.0.1: the neighbour pass only counts misses for hosts on its own segments ─
+    transitions = []
+    p._tracked_macs = lambda: {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}
+    p._ip_binary = lambda: "ip"
+    p._local_networks = lambda ip_bin: nets
+    p._tracked_subnets = lambda: {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}
+    p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    p._current_ip_hostname = lambda mac: (None, None)
+
+    class _Result:
+        returncode = 0
+        stdout = ""  # nobody answers: every LOCAL device misses
+
+    p.subprocess = types.SimpleNamespace(run=lambda *a, **k: _Result(), TimeoutExpired=Exception)
+    fdb = FakeDB([[{"mac": "aa:bb:cc:dd:ee:01", "online": 1, "misses": 2}]])
+    p._get_db = lambda: fdb
+    p._apply_transition = lambda mac, online: transitions.append((mac, online))
+    p._neighbor_tick()
+    check(
+        transitions == [("aa:bb:cc:dd:ee:01", False)],
+        f"_neighbor_tick: the device on the host's own segment goes offline after its third miss, the one behind a router is never judged (got {transitions})",
+    )
+    state_reads = [s for s in fdb.statements if s[0] == "SELECT"]
+    check(
+        len(state_reads) == 1 and state_reads[0][2] == ("aa:bb:cc:dd:ee:01",),
+        "_neighbor_tick: only the local device's state is read at all",
+    )
+    transitions.clear()
+    p._local_networks = lambda ip_bin: None
+    fdb = FakeDB()
+    p._get_db = lambda: fdb
+    p._neighbor_tick()
+    check(
+        transitions == [] and fdb.statements == [],
+        "_neighbor_tick: when the host's own subnets cannot be read, the pass counts nothing",
+    )
+    rows = [{"mac": "aa:bb:cc:dd:ee:01"}, {"mac": "aa:bb:cc:dd:ee:02"}]
+    p._local_networks = lambda ip_bin: nets
+    marked = p._mark_lease_based([dict(r) for r in rows])
+    check(
+        [r["lease_based"] for r in marked] == [False, True],
+        "the page marks the device behind a router 'lease-based' and leaves the local one alone",
+    )
+    p._local_networks = lambda ip_bin: None
+    check(
+        all(r["lease_based"] is None for r in p._mark_lease_based([dict(r) for r in rows])),
+        "the page says nothing when it cannot tell",
+    )
 
     # ── register(): runs end to end against a stub jen.plugin_api ───────────
     row_action_calls = _stub_jen_plugin_api()
