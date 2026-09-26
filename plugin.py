@@ -81,7 +81,7 @@ every other device the state follows lease events alone, and the page says
 every transition publishes every tracked client's MAC, label, IP, hostname and state
 to every enabled sink, so configuring one (add, pause/enable, test, remove) is a
 superadmin action; other admins see the list read-only. A tracked device belongs to
-the subnet its MAC is in NOW (device, active lease, reservation), derived here — never
+the subnet its MAC is in NOW (Jen's one precedence: active lease, reservation, device), derived here — never
 a value in the request. Tracking a MAC that is already tracked authorises the existing
 row first and only ever changes its label, never its subnet. A MAC with no subnet is for
 unrestricted callers only.
@@ -481,43 +481,12 @@ def _normalize_mac(raw):
 
 
 def _current_subnet_for_mac(mac):
-    """The MAC's current subnet — a device's last-known placement, then an active lease, then
-    a reservation (a global reservation carries no useful subnet, so it falls through)."""
-    db = None
-    try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("SELECT last_subnet_id FROM devices WHERE mac=%s", (mac,))
-            row = cur.fetchone()
-            if row and row.get("last_subnet_id") is not None:
-                return row["last_subnet_id"]
-    except Exception as e:
-        logger.warning(f"Presence: device subnet lookup failed: {e}")
-    finally:
-        if db:
-            db.close()
-    hex_mac = mac.replace(":", "").upper()
-    kdb = None
-    try:
-        kdb = _get_kea_db()
-        with kdb.cursor() as cur:
-            cur.execute("SELECT subnet_id FROM lease4 WHERE HEX(hwaddr)=%s AND state=0", (hex_mac,))
-            row = cur.fetchone()
-            if row:
-                return row["subnet_id"]
-            cur.execute(
-                "SELECT dhcp4_subnet_id AS subnet_id FROM hosts WHERE dhcp_identifier_type=0 AND HEX(dhcp_identifier)=%s",
-                (hex_mac,),
-            )
-            row = cur.fetchone()
-            if row and row["subnet_id"]:
-                return row["subnet_id"]
-    except Exception as e:
-        logger.warning(f"Presence: lease/reservation subnet lookup failed: {e}")
-    finally:
-        if kdb:
-            kdb.close()
-    return None
+    """The MAC's current subnet, by Jen's ONE precedence (current lease, then reservation, then the
+    device's last known subnet, else None) - `plugin_api.client_subnet_for_mac`, v5.65.6. Three plugins
+    used to carry private variants that disagreed on the order."""
+    from jen.plugin_api import client_subnet_for_mac
+
+    return client_subnet_for_mac(mac)
 
 
 def _current_ip_hostname(mac):
@@ -824,11 +793,65 @@ def _recorded_online(mac):
             db.close()
 
 
+def _has_active_lease(mac):
+    """Does Kea still hold an active lease (state 0, not past its expiry - Jen's own definition of
+    active) for this MAC? An unreadable lease table counts as "no": the old behaviour."""
+    hex_mac = mac.replace(":", "").upper()
+    kdb = None
+    try:
+        kdb = _get_kea_db()
+        with kdb.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM lease4 WHERE HEX(hwaddr)=%s AND state=0 AND expire > NOW()", (hex_mac,)
+            )
+            row = cur.fetchone()
+            return bool(row and row["n"])
+    except Exception as e:
+        logger.warning(f"Presence: could not check {mac} for another active lease: {e}")
+        return False
+    finally:
+        if kdb:
+            kdb.close()
+
+
+def _refresh_subnet(mac):
+    """Follow the client: `pr_tracked.subnet_id` is what the page and untrack authorise on, and it was
+    written once, when the device was tracked, and never again - a client that moved to another subnet
+    stayed visible to (and removable by) a user scoped to the old one. Updated from the MAC's current
+    subnet on every lease event handled here; a MAC with no known subnet keeps its last one."""
+    subnet_id = _current_subnet_for_mac(mac)
+    if subnet_id is None:
+        return
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE pr_tracked SET subnet_id=%s WHERE mac=%s AND (subnet_id IS NULL OR subnet_id<>%s)",
+                (subnet_id, mac, subnet_id),
+            )
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Presence: could not refresh the subnet of {mac}: {e}")
+    finally:
+        if db:
+            db.close()
+
+
 def _on_lease_event(event):
     mac = (event.get("mac") or "").lower()
     if not mac or mac not in _tracked_macs():
         return
-    online = event.get("kind") == "lease.new"
+    _refresh_subnet(mac)
+    kind = event.get("kind")
+    if kind == "lease.expired":
+        # One lease ending is not the client leaving: a device that moved subnet, or holds a second lease,
+        # is still there. Offline only when no active lease remains.
+        if _has_active_lease(mac):
+            return
+        online = False
+    else:  # lease.new, or lease.ip_changed (the client is present, at a new address)
+        online = True
     # A lease.new for a device already recorded online (a renewal is reported the same way) is not a
     # transition: publishing it again would re-send, re-audit and re-emit an unchanged state.
     if _recorded_online(mac) is online:
@@ -1093,7 +1116,8 @@ def track():
     try:
         refusal = _track(mac, label, "")
     except Exception as e:
-        flash(f"Could not track {mac}: {e}", "error")
+        logger.error(f"Presence: could not track {mac}: {e}")
+        flash(f"Could not track {mac}; the details are in Jen's log.", "error")
         return redirect(url_for("presence.index"))
     if refusal:
         flash(refusal, "error")
@@ -1122,7 +1146,8 @@ def untrack(mac):
         flash("No longer tracked.", "success")
         _audit("PRESENCE_UNTRACK", mac, "untracked")
     except Exception as e:
-        flash(f"Could not untrack {mac}: {e}", "error")
+        logger.error(f"Presence: could not untrack {mac}: {e}")
+        flash(f"Could not untrack {mac}; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1146,7 +1171,8 @@ def track_from_row():
     try:
         refusal = _track(mac, hostname, " source=row")
     except Exception as e:
-        flash(f"Could not track {mac}: {e}", "error")
+        logger.error(f"Presence: could not track {mac}: {e}")
+        flash(f"Could not track {mac}; the details are in Jen's log.", "error")
         return redirect(url_for("presence.index"))
     if refusal:
         flash(refusal, "error")
@@ -1210,7 +1236,8 @@ def add_sink():
         flash(f"{name} added.", "success")
         _audit("PRESENCE_ADD_SINK", name, f"kind={kind}")
     except Exception as e:
-        flash(f"Could not add sink: {e}", "error")
+        logger.error(f"Presence: could not add sink: {e}")
+        flash("Could not add the sink; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1236,7 +1263,8 @@ def toggle_sink(sink_id):
         db.commit()
         flash("Sink enabled." if new_enabled else "Sink paused.", "success")
     except Exception as e:
-        flash(f"Could not update sink: {e}", "error")
+        logger.error(f"Presence: could not update sink: {e}")
+        flash("Could not update the sink; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1257,7 +1285,8 @@ def delete_sink(sink_id):
         flash("Sink removed.", "success")
         _audit("PRESENCE_DELETE_SINK", str(sink_id), "sink removed")
     except Exception as e:
-        flash(f"Could not remove sink: {e}", "error")
+        logger.error(f"Presence: could not remove sink: {e}")
+        flash("Could not remove the sink; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1319,6 +1348,7 @@ def register(app):
 
     subscribe("lease.new", _on_lease_event)
     subscribe("lease.expired", _on_lease_event)
+    subscribe("lease.ip_changed", _on_lease_event)
     register_periodic(PLUGIN_ID, "neighbor-tick", _neighbor_tick, _NEIGH_TICK_MINUTES)
 
     logger.info("Presence plugin registered")

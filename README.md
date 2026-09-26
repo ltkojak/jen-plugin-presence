@@ -6,13 +6,13 @@ Publishes tracked devices' online/offline state to [Home Assistant](https://www.
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.65.2 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.65.6 or later
 
 ## How a device is judged online or offline
 
 Two signals feed one state per tracked device:
 
-- **Lease events** (`lease.new` / `lease.expired`) — Kea has already decided the device is there or gone, so these apply immediately, no delay.
+- **Lease events** (`lease.new` / `lease.ip_changed` / `lease.expired`) — Kea has already decided the device is there or gone, so these apply immediately, no delay. A `lease.expired` marks a device offline only when no other active lease remains for its MAC, and every handled lease event refreshes the device's stored subnet, so a client that moves subnet follows it.
 - **A periodic pass** over `ip -4 neigh show` (the same table [Network Discovery](https://github.com/ltkojak/jen-plugin-network-discovery) reads), every 5 minutes — Jen's own floor for any plugin's periodic job. A device counts as *seen* on a pass only when its neighbour entry is `REACHABLE`, `DELAY`, or `PROBE` (actively confirmed, or being actively reconfirmed); anything else, including a `STALE` entry, does not. Any single sighting flips a device online at once; going *offline* needs **three consecutive** passes with no sighting, so one missed ARP probe cycle never flips a device early.
 
 **A limitation to know about:** `ip -4 neigh` only ever holds hosts on a segment the Jen host has an interface on. Each pass therefore reads the host's own interface subnets (`ip -4 -o addr show`) and counts a miss only for a tracked device on one of them. A device anywhere else (behind a router, on a VLAN Jen has no interface in) is **lease-based**: it is online from its lease and offline when the lease expires, never from a probe, and the page says "lease-based" beside its state. If the host's own subnets cannot be read, the pass counts nothing.

@@ -75,7 +75,7 @@ def _stub_jen_plugin_api():
     plugin_api = types.ModuleType("jen.plugin_api")
     plugin_api.register_row_action = register_row_action
     plugin_api.register_periodic = register_periodic
-    plugin_api.subscribe = lambda kind, fn: None
+    plugin_api.subscribe = lambda kind, fn: SUBSCRIBED.append(kind)
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -91,6 +91,7 @@ def load_plugin():
 
 
 failures = []
+SUBSCRIBED = []  # every kind register() subscribed to
 
 
 def check(cond, msg):
@@ -557,6 +558,8 @@ def main():
     applied = []
     p._apply_transition = lambda mac, online: applied.append((mac, online))
     p._tracked_macs = lambda: {"aa:bb:cc:dd:ee:01"}
+    p._has_active_lease = lambda mac: False
+    p._refresh_subnet = lambda mac: None
     for recorded, kind, expect in (
         (True, "lease.new", []),
         (False, "lease.new", [("aa:bb:cc:dd:ee:01", True)]),
@@ -568,6 +571,84 @@ def main():
         p._recorded_online = lambda mac, recorded=recorded: recorded
         p._on_lease_event({"mac": "AA:BB:CC:DD:EE:01", "kind": kind})
         check(applied == expect, f"_on_lease_event: {kind} for a device recorded {recorded} -> {expect}")
+
+    # ── 1.0.2: the lease path follows the client ─────────────────────────────
+    # (a) lease.ip_changed is now handled: the client is present at a new address
+    applied.clear()
+    p._recorded_online = lambda mac: False
+    p._on_lease_event({"mac": "aa:bb:cc:dd:ee:01", "kind": "lease.ip_changed"})
+    check(applied == [("aa:bb:cc:dd:ee:01", True)], "_on_lease_event: lease.ip_changed brings an offline device online")
+    # (b) lease.expired is offline ONLY when no active lease remains
+    for has_lease, expect in ((True, []), (False, [("aa:bb:cc:dd:ee:01", False)])):
+        applied.clear()
+        p._recorded_online = lambda mac: True
+        p._has_active_lease = lambda mac, has_lease=has_lease: has_lease
+        p._on_lease_event({"mac": "aa:bb:cc:dd:ee:01", "kind": "lease.expired"})
+        check(applied == expect, f"_on_lease_event: lease.expired with another active lease={has_lease} -> {expect}")
+    # (c) the subnet is refreshed on every handled event, even when nothing transitions
+    refreshed = []
+    p._refresh_subnet = lambda mac: refreshed.append(mac)
+    p._recorded_online = lambda mac: True
+    p._has_active_lease = lambda mac: True
+    p._on_lease_event({"mac": "aa:bb:cc:dd:ee:01", "kind": "lease.new"})
+    p._on_lease_event({"mac": "aa:bb:cc:dd:ee:01", "kind": "lease.expired"})
+    check(
+        len(refreshed) == 2,
+        "_on_lease_event: pr_tracked.subnet_id is refreshed on every handled event, transition or not",
+    )
+    refreshed.clear()
+    p._on_lease_event({"mac": "aa:bb:cc:dd:ee:77", "kind": "lease.new"})
+    check(refreshed == [], "_on_lease_event: an untracked MAC is ignored entirely")
+    # the REAL functions, on a fresh load (the tests above replaced several on `p`)
+    fresh = load_plugin()
+
+    # the move A -> B: the stored subnet follows the client
+    fresh._current_subnet_for_mac = lambda mac: 2
+    fdb = FakeDB()
+    fresh._get_db = lambda: fdb
+    fresh._refresh_subnet("aa:bb:cc:dd:ee:01")
+    upd = [s for s in fdb.statements if s[0] == "UPDATE"]
+    check(
+        len(upd) == 1 and upd[0][2][0] == 2 and "pr_tracked" in upd[0][1],
+        "_refresh_subnet: a client that moved to subnet 2 is re-filed under subnet 2",
+    )
+    fresh._current_subnet_for_mac = lambda mac: None
+    fdb = FakeDB()
+    fresh._get_db = lambda: fdb
+    fresh._refresh_subnet("aa:bb:cc:dd:ee:01")
+    check(fdb.statements == [], "_refresh_subnet: a MAC with no known subnet keeps its last one")
+
+    # the two-leases case: one of two leases ending leaves the device online
+    for n, expect in ((2, True), (1, True), (0, False)):
+        kfdb = FakeDB([{"n": n}])
+        fresh._get_kea_db = lambda kfdb=kfdb: kfdb
+        check(
+            fresh._has_active_lease("aa:bb:cc:dd:ee:01") is expect,
+            f"_has_active_lease: {n} active lease(s) -> {expect}",
+        )
+        check(
+            "expire > NOW()" in kfdb.statements[0][1],
+            "_has_active_lease: active means state 0 AND not past its expiry - Jen's own definition",
+        )
+    kfdb = FakeDB()
+    kfdb.cursor = lambda: (_ for _ in ()).throw(RuntimeError("down"))
+    fresh._get_kea_db = lambda: kfdb
+    check(
+        fresh._has_active_lease("aa:bb:cc:dd:ee:01") is False,
+        "_has_active_lease: an unreadable lease table falls back to 'no other lease'",
+    )
+
+    # the subnet comes from Jen's ONE precedence
+    jen_api = types.ModuleType("jen.plugin_api")
+    jen_api.client_subnet_for_mac = lambda mac: {"aa:bb:cc:dd:ee:09": 4}.get(mac)
+    sys.modules["jen"] = types.ModuleType("jen")
+    sys.modules["jen.plugin_api"] = jen_api
+    sys.modules["jen"].plugin_api = jen_api
+    check(
+        load_plugin()._current_subnet_for_mac("aa:bb:cc:dd:ee:09") == 4
+        and load_plugin()._current_subnet_for_mac("aa:bb:cc:dd:ee:10") is None,
+        "_current_subnet_for_mac: answered by plugin_api.client_subnet_for_mac, not a private copy",
+    )
 
     # ── 1.0.1: the test button publishes nothing durable ─────────────────────
     published = []
@@ -670,6 +751,10 @@ def main():
         registered = False
         print(f"      register() raised: {e}")
     check(registered, "register(): runs end to end without raising against a real-rule stub")
+    check(
+        sorted(SUBSCRIBED) == ["lease.expired", "lease.ip_changed", "lease.new"],
+        f"register(): subscribes to lease.new, lease.expired AND lease.ip_changed (got {sorted(SUBSCRIBED)})",
+    )
     surfaces = sorted(c[1] for c in row_action_calls)
     check(
         surfaces == ["device", "lease"],

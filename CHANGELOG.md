@@ -1,5 +1,25 @@
 # Presence Plugin — Changelog
 
+## [1.0.2] - 2026-09-25
+
+Requires Jen 5.65.6 or later (`client_subnet_for_mac` in the plugin API).
+
+### Fixed: a tracked client that changed subnet stayed filed under the old one
+
+`pr_tracked.subnet_id` was written when a device was tracked and never updated. The page and untrack authorise on that stored value, so a user scoped to subnet A kept seeing and removing a client that now lived in subnet B. Every lease event the plugin handles now refreshes the stored subnet from Jen's `client_subnet_for_mac` (the one precedence: current lease, then reservation, then the device's last known subnet), so the device follows the client. A MAC with no known subnet keeps its last one. The same helper replaces the plugin's private lookup, which ordered the sources differently from Wake and Switch Port.
+
+### Fixed: a device was declared offline while another lease was still active
+
+Every `lease.expired` was treated as "the device left". A client that moved subnet, or holds a second lease, expires one lease and is still there. Offline now needs `lease.expired` **and** no remaining active lease for the MAC (state 0 and not past its expiry, Jen's own definition of active). The plugin also subscribes to `lease.ip_changed` now, which Jen reports when a client's address changes, and treats it as the client being present.
+
+### Fixed: raw exception text on the page
+
+A failed track, untrack, or sink change put the database's own error message into the page. The details go to Jen's log and the page shows a generic message. A sink's connection failure on **Send test** is still shown: it is the diagnostic about the integration the superadmin just configured, not an internal error.
+
+### Changed
+
+- `tools/test_plugin.py` covers the move A to B, the two-leases case, `lease.ip_changed`, the subnet refresh on every handled event, and the real `_has_active_lease` against a fake lease table.
+
 ## [1.0.1] - 2026-09-25
 
 Requires Jen 5.65.2 or later (the `can_access_subnet` helper in the plugin API).

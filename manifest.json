@@ -1,10 +1,10 @@
 {
   "id": "presence",
   "name": "Presence",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Publishes tracked devices' online/offline state to Home Assistant (webhook), MQTT, or any HTTP endpoint, so the house can react to a phone joining or leaving. Opt-in per MAC — nothing is published for a device you haven't chosen to track.",
   "author": "Matthew Thibodeau",
-  "requires_jen": "5.65.2",
+  "requires_jen": "5.65.6",
   "plugin_api": 3,
   "tags": [
     "network",
