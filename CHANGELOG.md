@@ -1,5 +1,26 @@
 # Presence Plugin — Changelog
 
+## [1.0.4] - 2026-09-27
+
+Jen's new system scenario 13 (Q101 c) runs Presence against a real eclipse-mosquitto broker over
+plain and TLS listeners for the first time — every prior check of the MQTT client was structural
+(byte-range assertions against the OASIS spec), never against a real broker's actual behaviour
+end to end. Found reading the send path while building that scenario, ahead of the dispatch
+itself:
+
+### Fixed: a sink's last_error never cleared once set
+
+A failed send recorded the failure on the sink (`last_error`), but nothing ever cleared it on a
+later successful one — a broker that had gone down and come back kept showing its old failure on
+the Presence page indefinitely, with no way to tell "still down" from "recovered five minutes
+ago" from "recovered a week ago". Every send that does not raise now clears the sink's
+`last_error`.
+
+### Changed
+
+- `tools/test_plugin.py` checks a failed send records the error and does NOT clear it, and a
+  following successful send does.
+
 ## [1.0.3] - 2026-09-27
 
 Jen's Q100 sweep: onto Jen 5.65.10's shared helpers, and the sink-publish path moved off Jen's

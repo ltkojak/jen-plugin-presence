@@ -756,6 +756,24 @@ def _record_sink_error(sink_id, error):
             db.close()
 
 
+def _clear_sink_error(sink_id):
+    """v1.0.4 (Q101 c, found by system scenario 13) — nothing cleared `last_error` once a sink had
+    one; a broker that had gone down and come back kept showing its old failure on the Presence
+    page indefinitely, with no way to tell "still down" from "recovered days ago". Called after
+    every send that does NOT raise; a no-op UPDATE (already NULL) is cheap and always correct."""
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("UPDATE pr_sinks SET last_error=NULL WHERE id=%s AND last_error IS NOT NULL", (sink_id,))
+        db.commit()
+    except Exception as e:
+        logger.error(f"Presence: could not clear sink error: {e}")
+    finally:
+        if db:
+            db.close()
+
+
 # ── Transitions ───────────────────────────────────────────────────────────────
 
 
@@ -803,6 +821,8 @@ def _ensure_publish_worker():
                 except Exception as e:
                     logger.warning(f"Presence: sink {sink.get('name')!r} failed for {mac}: {e}")
                     _record_sink_error(sink["id"], str(e)[:300])
+                else:
+                    _clear_sink_error(sink["id"])
                 finally:
                     _publish_queue.task_done()
 

@@ -894,6 +894,26 @@ def main():
         "_queue_publish: a second transition reuses the same worker instead of starting another",
     )
 
+    # ── 1.0.4 (Q101 c, system scenario 13): a successful send clears a sink's last_error ──
+    cleared = []
+    failed = []
+    fresh._clear_sink_error = lambda sid: cleared.append(sid)
+    fresh._record_sink_error = lambda sid, err: failed.append((sid, err))
+    fresh._send_to_sink = lambda *a, **k: (_ for _ in ()).throw(fresh._PresenceError("broker unreachable"))
+    fresh._queue_publish({"id": 7, "name": "Flaky"}, "aa:bb:cc:dd:ee:04", "L4", True, "iso", None, None)
+    fresh._publish_queue.join()
+    check(
+        failed == [(7, "broker unreachable")] and cleared == [],
+        f"_queue_publish: a failed send records the error and does NOT clear it (got failed={failed}, cleared={cleared})",
+    )
+    fresh._send_to_sink = lambda *a, **k: None  # the broker recovered
+    fresh._queue_publish({"id": 7, "name": "Flaky"}, "aa:bb:cc:dd:ee:04", "L4", True, "iso", None, None)
+    fresh._publish_queue.join()
+    check(
+        cleared == [7],
+        f"_queue_publish: a successful send clears the sink's last_error - it used to stay stuck forever once set (got {cleared})",
+    )
+
     # a full queue drops the update and logs, rather than blocking the caller
     fresh._publish_thread = types.SimpleNamespace(is_alive=lambda: True)  # _ensure_publish_worker short-circuits
     full_q = fresh.queue.Queue(maxsize=1)
