@@ -15,6 +15,7 @@ Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 
 import importlib.util
 import os
+import re
 import sys
 import types
 
@@ -54,6 +55,18 @@ class _FakeApp:
         pass
 
 
+def _stub_normalize_mac(raw):
+    """Same contract as jen/services/plugin_helpers.py::normalize_mac — a MAC as lowercase
+    colon-separated, or None for anything that isn't twelve hex digits once separators are
+    dropped."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", raw).lower()
+    if len(cleaned) != 12:
+        return None
+    return ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
+
+
 def _stub_jen_plugin_api():
     """A stub `jen`/`jen.plugin_api` sufficient for register(app) to run
     end to end, with register_row_action enforcing the same 'surface
@@ -76,6 +89,7 @@ def _stub_jen_plugin_api():
     plugin_api.register_row_action = register_row_action
     plugin_api.register_periodic = register_periodic
     plugin_api.subscribe = lambda kind, fn: SUBSCRIBED.append(kind)
+    plugin_api.normalize_mac = _stub_normalize_mac
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -104,6 +118,7 @@ def check(cond, msg):
 
 def main():
     p = load_plugin()
+    _stub_jen_plugin_api()
 
     # ── Remaining Length encoding (OASIS §2.2.3) ─────────────────────────────
     check(p.encode_remaining_length(0) == b"\x00", "encode_remaining_length: 0")
@@ -249,6 +264,13 @@ def main():
         "mqtt_discovery_payload: state_topic matches mqtt_state_topic exactly",
     )
 
+    # ── topic prefix validation (v1.0.3) ──────────────────────────────────────
+    check(p._valid_topic_prefix("jen/presence") is True, "_valid_topic_prefix: a normal prefix is accepted")
+    check(p._valid_topic_prefix("jen/#") is False, "_valid_topic_prefix: the '#' wildcard is refused")
+    check(p._valid_topic_prefix("jen/+/x") is False, "_valid_topic_prefix: the '+' wildcard is refused")
+    check(p._valid_topic_prefix("jen presence") is False, "_valid_topic_prefix: a space is refused")
+    check(p._valid_topic_prefix("") is False, "_valid_topic_prefix: empty is refused")
+
     payload = p.build_sink_payload("aa:bb:cc:dd:ee:ff", "Phone", True, "2026-09-24T00:00:00+00:00", "10.0.0.5", "phone")
     check(
         payload
@@ -266,6 +288,69 @@ def main():
     # ── MAC normalisation ─────────────────────────────────────────────────────
     check(p._normalize_mac("AA:BB:CC:DD:EE:FF") == "aa:bb:cc:dd:ee:ff", "_normalize_mac: uppercase colon form")
     check(p._normalize_mac("not-a-mac") == "", "_normalize_mac: garbage is refused, not raised")
+
+    # ── _current_ip_hostname / _current_ip_hostname_bulk: expiry + ordering (v1.0.3) ─────
+    class _KeaDB:
+        def __init__(self, rows):
+            self.rows = rows
+            self.statements = []
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql, params))
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return self.rows
+
+        def close(self):
+            pass
+
+    kdb = _KeaDB([{"ip": "10.1.0.5", "hostname": "phone"}])
+    p._get_kea_db = lambda: kdb
+    ip, hostname = p._current_ip_hostname("aa:bb:cc:dd:ee:01")
+    check((ip, hostname) == ("10.1.0.5", "phone"), "_current_ip_hostname: still returns the lease's ip/hostname")
+    check(
+        "expire > NOW()" in kdb.statements[0][0] and "ORDER BY expire DESC" in kdb.statements[0][0],
+        f"_current_ip_hostname: not-past-expiry and newest-first, same rule as _has_active_lease (got {kdb.statements[0][0]!r})",
+    )
+
+    check(p._current_ip_hostname_bulk([]) == {}, "_current_ip_hostname_bulk: no MACs, no query at all")
+    kdb = _KeaDB(
+        [
+            # aa:...:01 has two active leases; ORDER BY expire DESC means the FIRST row per MAC wins
+            {"mac_hex": "AABBCCDDEE01", "ip": "10.1.0.9", "hostname": "newest"},
+            {"mac_hex": "AABBCCDDEE01", "ip": "10.1.0.5", "hostname": "older"},
+            {"mac_hex": "AABBCCDDEE02", "ip": "10.1.0.6", "hostname": "phone2"},
+        ]
+    )
+    p._get_kea_db = lambda: kdb
+    got = p._current_ip_hostname_bulk(["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"])
+    check(
+        got == {"aa:bb:cc:dd:ee:01": ("10.1.0.9", "newest"), "aa:bb:cc:dd:ee:02": ("10.1.0.6", "phone2")},
+        f"_current_ip_hostname_bulk: ONE query for every MAC, the newest lease per MAC, a MAC with none is absent (got {got})",
+    )
+    check(
+        len(kdb.statements) == 1,
+        f"_current_ip_hostname_bulk: exactly one query for three MACs (got {len(kdb.statements)})",
+    )
+    kdb2 = _KeaDB([])
+    kdb2.cursor = lambda: (_ for _ in ()).throw(RuntimeError("down"))
+    p._get_kea_db = lambda: kdb2
+    check(
+        p._current_ip_hostname_bulk(["aa:bb:cc:dd:ee:01"]) == {},
+        "_current_ip_hostname_bulk: an unreadable lease table degrades to an empty map, never raises",
+    )
 
     # ── write gate — viewers can look at Presence but not change it ─────────
     p.current_user.role = "viewer"
@@ -443,9 +528,25 @@ def main():
         ("an MQTT URL password with no user name", {"name": "x", "kind": "mqtt", "url": "mqtt://:pw@host:1883"}, False),
         ("a good webhook", {"name": "x", "kind": "ha_webhook", "url": "https://ha.local/api/webhook/x"}, True),
         ("a good MQTT sink", {"name": "x", "kind": "mqtt", "url": "mqtt://bob@host:1883", "credential": "pw"}, True),
+        (
+            "a topic prefix with a wildcard '#'",
+            {"name": "x", "kind": "http", "url": "http://192.0.2.1/x", "topic_prefix": "jen/#"},
+            False,
+        ),
+        (
+            "a topic prefix with a wildcard '+'",
+            {"name": "x", "kind": "http", "url": "http://192.0.2.1/x", "topic_prefix": "jen/+/x"},
+            False,
+        ),
+        (
+            "a topic prefix with a space",
+            {"name": "x", "kind": "http", "url": "http://192.0.2.1/x", "topic_prefix": "jen presence"},
+            False,
+        ),
     )
     jen_api = types.ModuleType("jen.plugin_api")
     jen_api.encrypt_secret = lambda s: "enc:" + s
+    jen_api.normalize_mac = _stub_normalize_mac
     sys.modules["jen"] = types.ModuleType("jen")
     sys.modules["jen.plugin_api"] = jen_api
     sys.modules["jen"].plugin_api = jen_api
@@ -641,6 +742,7 @@ def main():
     # the subnet comes from Jen's ONE precedence
     jen_api = types.ModuleType("jen.plugin_api")
     jen_api.client_subnet_for_mac = lambda mac: {"aa:bb:cc:dd:ee:09": 4}.get(mac)
+    jen_api.normalize_mac = _stub_normalize_mac
     sys.modules["jen"] = types.ModuleType("jen")
     sys.modules["jen.plugin_api"] = jen_api
     sys.modules["jen"].plugin_api = jen_api
@@ -700,7 +802,7 @@ def main():
     p._local_networks = lambda ip_bin: nets
     p._tracked_subnets = lambda: {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}
     p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
-    p._current_ip_hostname = lambda mac: (None, None)
+    p._current_ip_hostname_bulk = lambda macs: {}
 
     class _Result:
         returncode = 0
@@ -759,6 +861,123 @@ def main():
     check(
         surfaces == ["device", "lease"],
         f"register(): a Track presence row action is registered on lease + device only, not reservation (got {surfaces})",
+    )
+    check(
+        p._publish_thread is None,
+        "register(): the publish worker is never started here — only lazily, on the first transition",
+    )
+
+    # ── the publish worker (v1.0.3): a bounded queue, its own thread, started lazily ─────
+    fresh = load_plugin()
+    sent = []
+    fresh._send_to_sink = lambda sink, mac, label, online, since_iso, ip, hostname: sent.append(
+        (sink["name"], mac, online)
+    )
+    fresh._record_sink_error = lambda sid, err: None
+    fresh._queue_publish(
+        {"id": 1, "name": "S"}, "aa:bb:cc:dd:ee:01", "L", True, "2026-09-27T00:00:00+00:00", None, None
+    )
+    fresh._publish_queue.join()
+    check(
+        sent == [("S", "aa:bb:cc:dd:ee:01", True)],
+        f"_queue_publish: the plugin's own worker thread actually calls _send_to_sink (got {sent})",
+    )
+    check(
+        fresh._publish_thread is not None and fresh._publish_thread.is_alive(),
+        "_queue_publish: the worker thread is running (daemon, started on demand)",
+    )
+    sent.clear()
+    fresh._queue_publish({"id": 1, "name": "S2"}, "aa:bb:cc:dd:ee:02", "L2", False, "iso", None, None)
+    fresh._publish_queue.join()
+    check(
+        sent == [("S2", "aa:bb:cc:dd:ee:02", False)],
+        "_queue_publish: a second transition reuses the same worker instead of starting another",
+    )
+
+    # a full queue drops the update and logs, rather than blocking the caller
+    fresh._publish_thread = types.SimpleNamespace(is_alive=lambda: True)  # _ensure_publish_worker short-circuits
+    full_q = fresh.queue.Queue(maxsize=1)
+    full_q.put_nowait(("dummy",))
+    fresh._publish_queue = full_q
+    warnings = []
+    fresh.logger = types.SimpleNamespace(
+        warning=lambda msg: warnings.append(msg), error=lambda msg: None, info=lambda msg: None
+    )
+    fresh._queue_publish({"id": 1, "name": "Full"}, "aa:bb:cc:dd:ee:03", "L3", True, "iso", None, None)
+    check(
+        full_q.qsize() == 1 and any("full" in w for w in warnings),
+        f"_queue_publish: a full queue drops the update and logs a warning instead of blocking (got warnings={warnings})",
+    )
+
+    # ── _mqtt_publish: a refused/unreachable connect raises _PresenceError, not a bare OSError ──
+    fresh = load_plugin()
+    fresh.socket = types.SimpleNamespace(
+        create_connection=lambda *a, **k: (_ for _ in ()).throw(ConnectionRefusedError("refused"))
+    )
+    try:
+        fresh._mqtt_publish({"host": "h", "port": 1883, "use_tls": False}, None, None, "cid", [])
+        caught = None
+    except Exception as e:
+        caught = e
+    check(
+        isinstance(caught, fresh._PresenceError),
+        f"_mqtt_publish: a connection failure (create_connection, not just the CONNECT itself) raises _PresenceError (got {type(caught).__name__ if caught else None})",
+    )
+
+    # ── test_sink: only a _PresenceError is a caller-visible 'Test failed'; a real bug is not ──
+    fresh = load_plugin()
+    fresh.current_user.role = "superadmin"
+    ts_flashed = []
+    fresh.flash = lambda msg, cat="message": ts_flashed.append(msg)
+    fresh.redirect = lambda where: "redirect"
+    fresh.url_for = lambda *a, **k: "/x"
+    sink_row = {
+        "id": 1,
+        "name": "Sink1",
+        "kind": "http",
+        "url": "http://x",
+        "credential": None,
+        "topic_prefix": "jen/presence",
+        "retain": 0,
+        "discovery": 0,
+    }
+    fdb = FakeDB([sink_row])
+    fresh._get_db = lambda: fdb
+    fresh._send_to_sink = lambda *a, **k: (_ for _ in ()).throw(fresh._PresenceError("broker unreachable"))
+    ts_recorded = []
+    fresh._record_sink_error = lambda sid, err: ts_recorded.append((sid, err))
+    fresh.test_sink(1)
+    check(
+        bool(ts_flashed) and "Test failed" in ts_flashed[-1] and ts_recorded == [(1, "broker unreachable")],
+        f"test_sink: a _PresenceError is caught, flashed and recorded (got flashed={ts_flashed}, recorded={ts_recorded})",
+    )
+    fdb2 = FakeDB([sink_row])
+    fresh._get_db = lambda: fdb2
+    fresh._send_to_sink = lambda *a, **k: (_ for _ in ()).throw(KeyError("a bug, not a sink failure"))
+    try:
+        fresh.test_sink(1)
+        propagated = False
+    except KeyError:
+        propagated = True
+    except Exception:
+        propagated = False
+    check(
+        propagated,
+        "test_sink: a bug in _send_to_sink (KeyError, not _PresenceError) is NOT swallowed as 'Test failed' — it propagates",
+    )
+
+    # ── _existing_tracked: a DB failure degrades to 'no existing row', never an uncaught crash ──
+    class _BadTrackedDB:
+        def cursor(self):
+            raise RuntimeError("db down")
+
+        def close(self):
+            pass
+
+    fresh._get_db = lambda: _BadTrackedDB()
+    check(
+        fresh._existing_tracked("aa:bb:cc:dd:ee:01") is None,
+        "_existing_tracked: a DB failure degrades to None instead of propagating uncaught",
     )
 
     if failures:

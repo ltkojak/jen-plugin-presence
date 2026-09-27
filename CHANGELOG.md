@@ -1,5 +1,53 @@
 # Presence Plugin — Changelog
 
+## [1.0.3] - 2026-09-27
+
+Jen's Q100 sweep: onto Jen 5.65.10's shared helpers, and the sink-publish path moved off Jen's
+own shared event-dispatcher thread.
+
+### Fixed: an unreachable sink stalled every other plugin's event handling
+
+`_apply_transition` — called from `_on_lease_event`, which runs directly on Jen's shared
+event-dispatcher thread — sent to every enabled sink synchronously: up to 10 seconds per HTTP
+sink, or 10 seconds plus a TLS handshake and a CONNACK round trip per MQTT sink, once per
+transition. One unreachable broker stalled DNS Sync's own subscriber and every later event behind
+it, and a lease storm risked overflowing the dispatcher's 1000-event queue — exactly what
+`plugins/README.md` warns a subscriber must never do. Publishing now goes to the plugin's own
+single worker thread, started lazily on the first transition (never at `register()`, which stays
+pure) with a bounded queue; a burst that outruns it drops the newest update and logs, rather than
+blocking the dispatcher.
+
+### Fixed: the Send-test button could report a real bug as "Test failed"
+
+`test_sink` caught any `Exception` from `_send_to_sink` and flashed it as a connectivity failure —
+indistinguishable from an actual bug elsewhere in the plugin (a malformed sink row, say), which
+would then look like a broker problem to a superadmin and never get reported. The except is
+narrowed to `_PresenceError`, the type every sink transport actually raises for a real send
+failure; anything else is a bug and now surfaces as one. `_mqtt_publish`'s own connect call had
+been outside its `try` — a refused or unreachable broker raised a bare `OSError` past that except
+entirely — so it is inside now, same as every other MQTT failure.
+
+### Fixed: two smaller findings from the same audit
+
+- `_current_ip_hostname` selected a lease with no expiry check and no ordering — the same
+  omission `_has_active_lease` already guards against. It now applies the same rule (`state=0 AND
+  expire > NOW()`), newest lease first.
+- `add_sink` stored `topic_prefix` unvalidated: `#` and `+` are MQTT wildcard characters illegal
+  in a PUBLISH topic, and some brokers disconnect a client that sends one; a value containing
+  either, or a space, is refused now.
+- `_existing_tracked` had no exception handling around its database read at all; a failure now
+  degrades to "no existing row" (never more permissive — `_track` re-derives the subnet from the
+  MAC's current lease/reservation) instead of propagating uncaught.
+
+### Changed
+
+- The MAC check delegates to Jen's shared `normalize_mac()`.
+- `_local_macs` (behind the neighbour pass and every page render of the tracked list) reads every
+  tracked MAC's current lease in ONE query instead of one per MAC.
+- `tools/test_plugin.py` drives the publish worker end to end (a real thread, drained with
+  `Queue.join()`), a full queue, the narrowed `test_sink` except in both directions, and the
+  `_mqtt_publish` connect-failure wrapping directly.
+
 ## [1.0.2] - 2026-09-25
 
 Requires Jen 5.65.6 or later (`client_subnet_for_mac` in the plugin API).

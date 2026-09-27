@@ -99,11 +99,13 @@ import ipaddress
 import json
 import logging
 import os as _os
+import queue
 import re
 import shutil
 import socket
 import ssl
 import subprocess
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -138,6 +140,7 @@ _OFFLINE_MISS_THRESHOLD = 3
 _NEIGH_TICK_MINUTES = 5
 _HTTP_TIMEOUT_S = 10
 _MQTT_TIMEOUT_S = 10
+_PUBLISH_QUEUE_MAX = 200
 _MQTT_KEEP_ALIVE_S = 30
 
 
@@ -471,13 +474,9 @@ def _audit(action, target, detail):
 
 
 def _normalize_mac(raw):
-    if not raw:
-        return ""
-    cleaned = re.sub(r"[^0-9a-fA-F]", "", raw).lower()
-    if len(cleaned) != 12:
-        return ""
-    mac = ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
-    return mac if _MAC_RE.match(mac) else ""
+    from jen.plugin_api import normalize_mac
+
+    return normalize_mac(raw) or ""
 
 
 def _current_subnet_for_mac(mac):
@@ -498,8 +497,13 @@ def _current_ip_hostname(mac):
     try:
         kdb = _get_kea_db()
         with kdb.cursor() as cur:
+            # v1.0.3 — this used to have no expiry check and no ORDER BY: a past-expiry row (state
+            # is only updated on the next lease event) or an arbitrary one among several could win.
+            # Same rule _has_active_lease applies, plus the newest lease first.
             cur.execute(
-                "SELECT inet_ntoa(address) AS ip, hostname FROM lease4 WHERE HEX(hwaddr)=%s AND state=0", (hex_mac,)
+                "SELECT inet_ntoa(address) AS ip, hostname FROM lease4 WHERE HEX(hwaddr)=%s AND state=0 "
+                "AND expire > NOW() ORDER BY expire DESC LIMIT 1",
+                (hex_mac,),
             )
             row = cur.fetchone()
             if row:
@@ -510,6 +514,42 @@ def _current_ip_hostname(mac):
         if kdb:
             kdb.close()
     return None, None
+
+
+def _current_ip_hostname_bulk(macs):
+    """{mac: (ip, hostname)} for every MAC in `macs` that currently holds an active lease, in ONE
+    query — `_local_macs` (behind both the neighbour pass and every page render of the tracked
+    list) used to call `_current_ip_hostname` once per tracked MAC. Same rule as that function
+    (state 0, not past expiry, newest lease wins); never raises, and a MAC with no active lease is
+    simply absent from the result rather than mapped to (None, None)."""
+    macs = [m for m in macs if m]
+    if not macs:
+        return {}
+    hex_macs = [m.replace(":", "").upper() for m in macs]
+    by_hex = dict(zip(hex_macs, macs, strict=False))
+    placeholders = ",".join(["%s"] * len(hex_macs))
+    kdb = None
+    try:
+        kdb = _get_kea_db()
+        with kdb.cursor() as cur:
+            cur.execute(
+                f"SELECT HEX(hwaddr) AS mac_hex, inet_ntoa(address) AS ip, hostname FROM lease4 "
+                f"WHERE HEX(hwaddr) IN ({placeholders}) AND state=0 AND expire > NOW() "
+                "ORDER BY expire DESC",  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
+                tuple(hex_macs),
+            )
+            out = {}
+            for row in cur.fetchall():
+                mac = by_hex.get(row["mac_hex"])
+                if mac and mac not in out:  # ORDER BY expire DESC: the first row seen per MAC is the one to keep
+                    out[mac] = (row.get("ip"), row.get("hostname"))
+            return out
+    except Exception as e:
+        logger.warning(f"Presence: bulk lease lookup failed: {e}")
+        return {}
+    finally:
+        if kdb:
+            kdb.close()
 
 
 # ── Candidates for the Track picker ──────────────────────────────────────────
@@ -579,8 +619,12 @@ def _recv_exact(sock, n):
 def _mqtt_publish(mqtt_info, username, password, client_id, messages):
     """messages: [(topic, payload_bytes, retain)]. Raises _PresenceError
     on any failure; never leaves a socket open."""
-    sock = socket.create_connection((mqtt_info["host"], mqtt_info["port"]), timeout=_MQTT_TIMEOUT_S)
+    sock = None
     try:
+        # v1.0.3 — create_connection() used to run OUTSIDE this try: a refused or unreachable
+        # broker raised a bare OSError straight past every caller (including test_sink, whose
+        # except is now narrowed to _PresenceError) instead of the friendly message below.
+        sock = socket.create_connection((mqtt_info["host"], mqtt_info["port"]), timeout=_MQTT_TIMEOUT_S)
         if mqtt_info["use_tls"]:
             ctx = ssl.create_default_context()
             sock = ctx.wrap_socket(sock, server_hostname=mqtt_info["host"])
@@ -594,7 +638,8 @@ def _mqtt_publish(mqtt_info, username, password, client_id, messages):
     except OSError as e:
         raise _PresenceError(str(e)[:200]) from e
     finally:
-        sock.close()
+        if sock:
+            sock.close()
 
 
 # ── HTTP sinks (impure: urllib only) ─────────────────────────────────────────────
@@ -671,6 +716,15 @@ def _send_to_sink(sink, mac, label, online, since_iso, ip, hostname, test=False)
     _mqtt_publish(mqtt_info, mqtt_info.get("username"), password, client_id, messages)
 
 
+def _valid_topic_prefix(prefix):
+    """A PUBLISH topic prefix, never a SUBSCRIBE filter: '#' and '+' are MQTT wildcard characters —
+    used here, some brokers refuse or disconnect the PUBLISH outright, and where they don't, every
+    topic built from it (state/attributes/discovery) silently stops matching what a subscriber
+    actually asked for. A space is not spec-illegal but no broker's own examples use one in a topic;
+    treated as a mistake here too."""
+    return bool(prefix) and not any(c in prefix for c in "#+ ")
+
+
 def _enabled_sinks():
     db = None
     try:
@@ -720,6 +774,50 @@ def _tracked_label(mac):
             db.close()
 
 
+_publish_queue = None
+_publish_thread = None
+_publish_lock = threading.Lock()
+
+
+def _ensure_publish_worker():
+    """Starts the plugin's own single publish-worker thread on the FIRST transition — never at
+    register(), which must stay pure (v5.5.0). A sink send is up to 10 s of HTTP, or 10 s plus TLS
+    and a CONNACK round trip for MQTT; running it inline on Jen's shared event-dispatcher thread
+    (`_on_lease_event` runs there) stalled every other plugin's subscriber behind one unreachable
+    broker, and risked overflowing the dispatcher's 1000-event queue during a lease storm."""
+    global _publish_queue, _publish_thread
+    with _publish_lock:
+        if _publish_thread is not None and _publish_thread.is_alive():
+            return
+        _publish_queue = queue.Queue(maxsize=_PUBLISH_QUEUE_MAX)
+
+        def _worker():
+            while True:
+                job = _publish_queue.get()
+                if job is None:
+                    _publish_queue.task_done()
+                    return
+                sink, mac, label, online, since_iso, ip, hostname = job
+                try:
+                    _send_to_sink(sink, mac, label, online, since_iso, ip, hostname)
+                except Exception as e:
+                    logger.warning(f"Presence: sink {sink.get('name')!r} failed for {mac}: {e}")
+                    _record_sink_error(sink["id"], str(e)[:300])
+                finally:
+                    _publish_queue.task_done()
+
+        _publish_thread = threading.Thread(target=_worker, name="presence-publish", daemon=True)
+        _publish_thread.start()
+
+
+def _queue_publish(sink, mac, label, online, since_iso, ip, hostname):
+    _ensure_publish_worker()
+    try:
+        _publish_queue.put_nowait((sink, mac, label, online, since_iso, ip, hostname))
+    except queue.Full:
+        logger.warning(f"Presence: publish queue is full — dropping the update for sink {sink.get('name')!r} / {mac}")
+
+
 def _apply_transition(mac, online):
     """The one place a transition is recorded and published, whichever
     signal (a lease event or the periodic neighbour pass) triggered
@@ -746,12 +844,10 @@ def _apply_transition(mac, online):
     label = _tracked_label(mac)
     ip, hostname = _current_ip_hostname(mac)
     since_iso = datetime.now(timezone.utc).isoformat()
+    # v1.0.3 — queued to the plugin's own worker thread instead of sent inline here; see
+    # _ensure_publish_worker.
     for sink in _enabled_sinks():
-        try:
-            _send_to_sink(sink, mac, label, online, since_iso, ip, hostname)
-        except Exception as e:
-            logger.warning(f"Presence: sink {sink.get('name')!r} failed for {mac}: {e}")
-            _record_sink_error(sink["id"], str(e)[:300])
+        _queue_publish(sink, mac, label, online, since_iso, ip, hostname)
     _audit("PRESENCE_TRANSITION", mac, "online" if online else "offline")
     try:
         from jen.plugin_api import emit
@@ -906,9 +1002,10 @@ def _local_macs(tracked, local_nets):
     """The subset of `tracked` whose ARP entries this host can see (see mac_is_local)."""
     subnets = _tracked_subnets()
     cidrs = {sid: info.get("cidr") for sid, info in _subnet_map().items()}
+    ips = _current_ip_hostname_bulk(tracked)
     out = set()
     for mac in tracked:
-        ip, _hostname = _current_ip_hostname(mac)
+        ip, _hostname = ips.get(mac, (None, None))
         if mac_is_local(ip, cidrs.get(subnets.get(mac)), local_nets):
             out.add(mac)
     return out
@@ -1060,13 +1157,18 @@ def index():
 
 
 def _existing_tracked(mac):
-    """The pr_tracked row for `mac`, or None."""
+    """The pr_tracked row for `mac`, or None. A DB failure degrades to "no existing row": `_track`
+    then derives the subnet fresh from the MAC's current lease/reservation, never more permissive
+    than the row it could not read."""
     db = None
     try:
         db = _get_db()
         with db.cursor() as cur:
             cur.execute("SELECT mac, subnet_id FROM pr_tracked WHERE mac=%s", (mac,))
             return cur.fetchone()
+    except Exception as e:
+        logger.warning(f"Presence: could not check for an existing tracked row for {mac}: {e}")
+        return None
     finally:
         if db:
             db.close()
@@ -1215,6 +1317,9 @@ def add_sink():
         flash("URL must start with http:// or https://.", "error")
         return redirect(url_for("presence.index"))
     topic_prefix = request.form.get("topic_prefix", "jen/presence").strip()[:100] or "jen/presence"
+    if not _valid_topic_prefix(topic_prefix):
+        flash("Topic prefix cannot contain '#', '+' or a space.", "error")
+        return redirect(url_for("presence.index"))
     retain = 1 if request.form.get("retain") else 0
     discovery = 1 if request.form.get("discovery") else 0
     credential = ""
@@ -1325,7 +1430,10 @@ def test_sink(sink_id):
             test=True,
         )
         flash(f"Test message sent to {sink['name']}.", "success")
-    except Exception as e:
+    except _PresenceError as e:
+        # v1.0.3 — narrowed from a bare `except Exception`: that also swallowed a genuine bug in
+        # _send_to_sink itself (a bad sink row, say) as an indistinguishable "Test failed" message.
+        # A connectivity/protocol failure is the only thing this button should report as such.
         flash(f"Test failed: {e}", "error")
         _record_sink_error(sink_id, str(e)[:300])
     return redirect(url_for("presence.index"))

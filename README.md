@@ -6,7 +6,7 @@ Publishes tracked devices' online/offline state to [Home Assistant](https://www.
 
 ## Requirements
 
-- [Jen](https://github.com/ltkojak/jen-kea) v5.65.6 or later
+- [Jen](https://github.com/ltkojak/jen-kea) v5.65.10 or later
 
 ## How a device is judged online or offline
 
