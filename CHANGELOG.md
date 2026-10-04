@@ -1,5 +1,21 @@
 # Presence Plugin — Changelog
 
+## [1.1.0] - 2026-10-04
+
+Requires Jen 5.68.0 (a 5.68.0 beta satisfies it): this release registers an **investigation provider**.
+
+### Added: state, last seen and where it is published, on Jen's Investigation page
+
+Jen's Investigation page (`/client`) now has a "What else Jen knows" section on its Overview, and this plugin
+contributes one card to it for a tracked client: whether it is online or offline, since when or last seen when, and —
+to an admin only, since sinks are an admin's — the names of the enabled sinks its state is published to (names only,
+never an address or a credential). A client that is not tracked adds no card.
+
+The card is judged on the subnet the MAC is in now (Jen's one precedence), falling back to the subnet stored on its
+tracked row, so a client that moved out of a restricted caller's subnets stops showing; a client outside the caller's
+scope — or in no subnet, for a restricted caller — gets nothing. `requires_jen` moves to 5.68.0 because the hook does
+not exist before it.
+
 ## [1.0.4] - 2026-09-27
 
 Jen's new system scenario 13 (Q101 c) runs Presence against a real eclipse-mosquitto broker over

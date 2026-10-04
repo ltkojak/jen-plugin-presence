@@ -1108,6 +1108,101 @@ def _neighbor_tick():
         _apply_transition(mac, online)
 
 
+# ── Investigation provider (v1.1.0, Jen 5.68.0) ──────────────────────────────
+
+
+def in_scope(subnet_id, accessible_subnet_ids, all_subnets):
+    """Pure: may a caller with this scope see something whose subnet is `subnet_id`? An unrestricted caller may; a
+    restricted one only for a subnet in its own set - and a subnet of None ("no attributable subnet") is for unrestricted
+    callers only, never read as allow."""
+    if all_subnets:
+        return True
+    return subnet_id is not None and subnet_id in set(accessible_subnet_ids or ())
+
+
+def _when(value):
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d %H:%M UTC")
+    return str(value) if value else ""
+
+
+def investigation_card(tracked, sink_names=None):
+    """Pure: the Investigation page's card from this MAC's tracked row (joined with its state), or None when it is not
+    tracked. `sink_names` is None when the caller may not see where presence is published (sinks are an admin's), else the
+    names of the enabled sinks - names only, never an address or a credential."""
+    if not tracked:
+        return None
+    label = tracked.get("label") or ""
+    online = tracked.get("online")
+    if online is None:
+        summary = "Tracked, with no state recorded yet"
+        state = "no state yet"
+    elif online:
+        summary = "Online" + (f" since {_when(tracked.get('since'))}" if tracked.get("since") else "")
+        state = "online"
+    else:
+        summary = "Offline" + (f", last seen {_when(tracked.get('last_seen'))}" if tracked.get("last_seen") else "")
+        state = "offline"
+    rows = [{"label": "State", "value": state}]
+    if label:
+        rows.insert(0, {"label": "Tracked as", "value": label})
+    if tracked.get("since"):
+        rows.append({"label": "In this state since", "value": _when(tracked["since"])})
+    if tracked.get("last_seen"):
+        rows.append({"label": "Last seen", "value": _when(tracked["last_seen"])})
+    if sink_names is not None:
+        rows.append({"label": "Published to", "value": ", ".join(sink_names) if sink_names else "no enabled sink"})
+    return {"summary": summary, "status": "ok", "rows": rows}
+
+
+def _tracked_for_mac(mac):
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT t.label, t.subnet_id, s.online, s.since, s.last_seen "
+                "FROM pr_tracked t LEFT JOIN pr_state s ON s.mac = t.mac WHERE t.mac=%s",
+                (mac,),
+            )
+            return cur.fetchone()
+    finally:
+        if db:
+            db.close()
+
+
+def _enabled_sink_names():
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("SELECT name FROM pr_sinks WHERE enabled=1 ORDER BY name LIMIT 10")
+            return [r["name"] for r in cur.fetchall()]
+    finally:
+        if db:
+            db.close()
+
+
+def _investigate(subject, accessible_subnet_ids, all_subnets):
+    """The Investigation page's card for the client Jen resolved. Judged on the subnet the MAC is in NOW (Jen's one
+    precedence), falling back to the subnet stored on its tracked row; a client outside the caller's scope - or in none,
+    for a restricted caller - gets nothing. Where presence is published is shown to an admin only."""
+    mac = _normalize_mac(getattr(subject, "mac", "") or "")
+    if not mac:
+        return None
+    tracked = _tracked_for_mac(mac)
+    if not tracked:
+        return None
+    subnet_id = _current_subnet_for_mac(mac)
+    if subnet_id is None:
+        subnet_id = tracked.get("subnet_id")
+    if not in_scope(subnet_id, accessible_subnet_ids, all_subnets):
+        return None
+    card = investigation_card(tracked, _enabled_sink_names() if _is_admin() else None)
+    card["href"] = "/management/presence"
+    return card
+
+
 # ── Routes: page ────────────────────────────────────────────────────────────
 
 
@@ -1462,7 +1557,7 @@ def test_sink(sink_id):
 def register(app):
     app.register_blueprint(bp)
 
-    from jen.plugin_api import register_periodic, register_row_action, subscribe
+    from jen.plugin_api import register_investigation_provider, register_periodic, register_row_action, subscribe
 
     for surface in ("lease", "device"):
         register_row_action(
@@ -1478,5 +1573,7 @@ def register(app):
     subscribe("lease.expired", _on_lease_event)
     subscribe("lease.ip_changed", _on_lease_event)
     register_periodic(PLUGIN_ID, "neighbor-tick", _neighbor_tick, _NEIGH_TICK_MINUTES)
+
+    register_investigation_provider(PLUGIN_ID, title="Presence", fn=_investigate)
 
     logger.info("Presence plugin registered")

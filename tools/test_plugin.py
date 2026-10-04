@@ -89,6 +89,7 @@ def _stub_jen_plugin_api():
     plugin_api.register_row_action = register_row_action
     plugin_api.register_periodic = register_periodic
     plugin_api.subscribe = lambda kind, fn: SUBSCRIBED.append(kind)
+    plugin_api.register_investigation_provider = lambda *a, **k: INVESTIGATION_CALLS.append((a, k))
     plugin_api.normalize_mac = _stub_normalize_mac
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
@@ -106,6 +107,7 @@ def load_plugin():
 
 failures = []
 SUBSCRIBED = []  # every kind register() subscribed to
+INVESTIGATION_CALLS = []  # every register_investigation_provider() call
 
 
 def check(cond, msg):
@@ -865,6 +867,100 @@ def main():
     check(
         p._publish_thread is None,
         "register(): the publish worker is never started here — only lazily, on the first transition",
+    )
+    check(
+        len(INVESTIGATION_CALLS) == 1
+        and INVESTIGATION_CALLS[0][0] == ("presence",)
+        and INVESTIGATION_CALLS[0][1]["fn"] is p._investigate,
+        "register(): exactly one investigation provider, the plugin's own",
+    )
+
+    # ── 1.1.0: the investigation provider ────────────────────────────────────
+    check(
+        p.in_scope(1, [1], False) and not p.in_scope(2, [1], False) and not p.in_scope(None, [1], False),
+        "in_scope: a restricted caller sees only its own subnets, and None is never allow",
+    )
+    check(p.in_scope(None, [], True), "in_scope: an unrestricted caller sees an unattributed MAC")
+    check(p.investigation_card(None) is None, "investigation_card: a client that is not tracked adds no card")
+    import datetime as _dt
+
+    t1, t0 = _dt.datetime(2026, 10, 1, 8, 30), _dt.datetime(2026, 10, 1, 7, 0)
+    tracked_on = {"label": "Phone", "subnet_id": 1, "online": 1, "since": t1, "last_seen": t1}
+    card = p.investigation_card(tracked_on)
+    check(
+        card["summary"] == "Online since 2026-10-01 08:30 UTC" and card["status"] == "ok",
+        f"investigation_card: an online device says since when (got {card['summary']!r})",
+    )
+    off = p.investigation_card(dict(tracked_on, online=0, since=t0, last_seen=t0))
+    check(
+        off["summary"] == "Offline, last seen 2026-10-01 07:00 UTC",
+        f"investigation_card: an offline device says when it was last seen (got {off['summary']!r})",
+    )
+    fresh_row = p.investigation_card({"label": "", "subnet_id": 1, "online": None, "since": None, "last_seen": None})
+    check("no state recorded yet" in fresh_row["summary"], "investigation_card: tracked but never judged says so")
+    check(
+        all(r["label"] != "Published to" for r in card["rows"]),
+        "investigation_card: where it is published is withheld unless the caller may see sinks",
+    )
+    shown = p.investigation_card(tracked_on, ["HA", "Broker"])
+    check(
+        {"label": "Published to", "value": "HA, Broker"} in shown["rows"],
+        "investigation_card: an admin sees the enabled sinks' names",
+    )
+    check(
+        {"label": "Published to", "value": "no enabled sink"} in p.investigation_card(tracked_on, [])["rows"],
+        "investigation_card: no enabled sink reads as such",
+    )
+    subject = types.SimpleNamespace(mac="AA:BB:CC:DD:EE:01")
+    p._current_subnet_for_mac = lambda mac: 1
+    p._is_admin = lambda: True
+    fdb = FakeDB([dict(tracked_on)])
+    p._get_db = lambda: fdb
+    # the second FakeDB read (the sinks) needs its own answer: one DB object serves both queries in order
+    fdb.selects.append([{"name": "HA"}])
+    got = p._investigate(subject, [1], False)
+    check(
+        got is not None and got["href"] == "/management/presence" and "Online since" in got["summary"],
+        f"_investigate: the card for a tracked client (got {got})",
+    )
+    check(
+        {"label": "Published to", "value": "HA"} in got["rows"]
+        and "pr_tracked t LEFT JOIN pr_state s" in fdb.statements[0][1]
+        and fdb.statements[0][2] == ("aa:bb:cc:dd:ee:01",),
+        "_investigate: an admin sees the sink names; the lookup is the one parameterised MAC query",
+    )
+    check(
+        all("credential" not in s[1] and "url" not in s[1] for s in fdb.statements),
+        "_investigate: the sinks query never reads a credential or an address",
+    )
+    p._is_admin = lambda: False
+    p._get_db = lambda: FakeDB([dict(tracked_on)])
+    check(
+        all(r["label"] != "Published to" for r in p._investigate(subject, [1], False)["rows"]),
+        "_investigate: a non-admin never sees the sinks",
+    )
+    p._get_db = lambda: FakeDB([None])
+    check(p._investigate(subject, [1], False) is None, "_investigate: a client that is not tracked gets None")
+    p._get_db = lambda: FakeDB([dict(tracked_on)])
+    check(p._investigate(subject, [2], False) is None, "_investigate: a client outside the caller's set is None")
+    p._current_subnet_for_mac = lambda mac: 2  # moved since it was tracked with subnet 1
+    p._get_db = lambda: FakeDB([dict(tracked_on)])
+    check(
+        p._investigate(subject, [1], False) is None,
+        "_investigate: judged on where the MAC is NOW, not the stale stored subnet",
+    )
+    p._current_subnet_for_mac = lambda mac: None
+    p._get_db = lambda: FakeDB([dict(tracked_on)])
+    check(p._investigate(subject, [1], False) is not None, "_investigate: the stored subnet is the fallback")
+    p._get_db = lambda: FakeDB([dict(tracked_on, subnet_id=None)])
+    check(
+        p._investigate(subject, [1], False) is None and p._investigate(subject, [], True) is not None,
+        "_investigate: a client with no subnet at all is for an unrestricted caller only",
+    )
+    check(
+        p._investigate(types.SimpleNamespace(mac=""), [1], True) is None
+        and p._investigate(types.SimpleNamespace(mac="nope"), [1], True) is None,
+        "_investigate: a subject with no (or an invalid) MAC gets None",
     )
 
     # ── the publish worker (v1.0.3): a bounded queue, its own thread, started lazily ─────
