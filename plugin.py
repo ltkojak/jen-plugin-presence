@@ -77,14 +77,20 @@ emits nothing). A pass now reads the host's own interface subnets first
 every other device the state follows lease events alone, and the page says
 "lease-based" beside it.
 
-**Who may do what (v1.0.1).** Sinks are global integrations with a credential, and
+**Who may do what.** Sinks are global integrations with a credential, and
 every transition publishes every tracked client's MAC, label, IP, hostname and state
 to every enabled sink, so configuring one (add, pause/enable, test, remove) is a
-superadmin action; other admins see the list read-only. A tracked device belongs to
-the subnet its MAC is in NOW (Jen's one precedence: active lease, reservation, device), derived here — never
-a value in the request. Tracking a MAC that is already tracked authorises the existing
-row first and only ever changes its label, never its subnet. A MAC with no subnet is for
-unrestricted callers only.
+superadmin action; admins who may not configure them see the list read-only. A tracked
+device is a STORED object (the rule is in plugins/README.md, "Stored data", which is the
+source - this paragraph only points at it): it belongs to the OWNER subnet in
+`pr_tracked.subnet_id`, written when the device is tracked and changed only by an explicit
+Move by a caller who can see both subnets (audited), and every surface (the list, relabel,
+untrack, the card) judges on that column alone. Where the device is NOW is derived at read
+time and shown only to a caller who may see that subnet; it never widens access. Tracking a
+MAC that is already tracked authorises the existing row first and only changes its label.
+A device with no owner subnet is for unrestricted callers only. A lookup that decides
+whether a row exists has three outcomes - found, not found, failed - and a failed one
+refuses without writing or auditing anything (v1.2.1).
 
 **One connect-publish-disconnect cycle per transition.** This plugin
 never holds an MQTT connection open — each transition opens a fresh
@@ -1329,10 +1335,15 @@ def index():
     )
 
 
+LOOKUP_FAILED = object()  # the existence lookup itself failed: neither "found" nor "not found"
+LOOKUP_REFUSAL = "Could not check the existing record — nothing was changed."
+
+
 def _existing_tracked(mac):
-    """The pr_tracked row for `mac`, or None. A DB failure degrades to "no existing row": `_track`
-    then derives the subnet fresh from the MAC's current lease/reservation, never more permissive
-    than the row it could not read."""
+    """The pr_tracked row for `mac` (found), None (the lookup worked and there is no such row), or LOOKUP_FAILED (the lookup raised).
+    Three states, never two (v1.2.1): a lookup that raises is not "absent". It used to degrade to "no existing row", so with the
+    database failing for this one SELECT, `_track` went on as if the device were new, judged it on the client's CURRENT subnet,
+    and its upsert relabelled a row a hidden subnet owns. Every caller refuses on LOOKUP_FAILED: nothing is written, nothing audited."""
     db = None
     try:
         db = _get_db()
@@ -1341,7 +1352,7 @@ def _existing_tracked(mac):
             return cur.fetchone()
     except Exception as e:
         logger.warning(f"Presence: could not check for an existing tracked row for {mac}: {e}")
-        return None
+        return LOOKUP_FAILED
     finally:
         if db:
             db.close()
@@ -1354,6 +1365,8 @@ def _track(mac, label, source):
     `subnet_id`, so a scoped admin who knew a hidden device's MAC could re-track it into their own subnet and read
     its state. The owner subnet moves only through `move_subnet`."""
     existing = _existing_tracked(mac)
+    if existing is LOOKUP_FAILED:
+        return LOOKUP_REFUSAL
     if existing is not None:
         if not _can(existing["subnet_id"]):
             return "That device is not on a subnet you can access."
@@ -1411,6 +1424,9 @@ def move_subnet(mac):
         return redirect(url_for("presence.index"))
     mac = _normalize_mac(mac)
     row = _existing_tracked(mac) if mac else None
+    if row is LOOKUP_FAILED:
+        flash(LOOKUP_REFUSAL, "error")
+        return redirect(url_for("presence.index"))
     if row is None:
         flash("Device not found.", "error")
         return redirect(url_for("presence.index"))
@@ -1446,6 +1462,9 @@ def untrack(mac):
         return redirect(url_for("presence.index"))
     mac = _normalize_mac(mac)
     row = _existing_tracked(mac) if mac else None
+    if row is LOOKUP_FAILED:
+        flash(LOOKUP_REFUSAL, "error")
+        return redirect(url_for("presence.index"))
     if row is None or not _can(row["subnet_id"]):
         flash("Device not found.", "error")
         return redirect(url_for("presence.index"))

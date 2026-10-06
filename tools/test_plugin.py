@@ -1251,9 +1251,68 @@ def main():
 
     fresh._get_db = lambda: _BadTrackedDB()
     check(
-        fresh._existing_tracked("aa:bb:cc:dd:ee:01") is None,
-        "_existing_tracked: a DB failure degrades to None instead of propagating uncaught",
+        fresh._existing_tracked("aa:bb:cc:dd:ee:01") is fresh.LOOKUP_FAILED,
+        "_existing_tracked: a DB failure is LOOKUP_FAILED (not None, and not an uncaught crash)",
     )
+    fresh._get_db = lambda: FakeDB([None])
+    check(
+        fresh._existing_tracked("aa:bb:cc:dd:ee:01") is None,
+        "_existing_tracked: a lookup that worked and found nothing is None",
+    )
+    fresh._get_db = lambda: FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2}])
+    check(
+        fresh._existing_tracked("aa:bb:cc:dd:ee:01") == {"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2},
+        "_existing_tracked: a row that exists is the row",
+    )
+
+    # ── 1.2.1: three-state lookups. A hidden object, a client visible in A, the FIRST statement raising, every later write able to
+    #    succeed: the route must refuse, write nothing, audit nothing ──
+    class _FlakyOnce:
+        """get_db() answers a database whose statements fail the first time, a working FakeDB every time after."""
+
+        def __init__(self, selects):
+            self.calls, self.dbs, self.selects = 0, [], selects
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 1:
+                return _BadTrackedDB()
+            db = FakeDB(list(self.selects))
+            self.dbs.append(db)
+            return db
+
+        def kinds(self):
+            return [k for db in self.dbs for k in db.kinds()]
+
+    audits_h = []
+    p._audit = lambda action, target, detail: audits_h.append((action, target, detail))
+    p._require_write = lambda: True
+    p._can = only_one
+    p._current_subnet_for_mac = lambda mac: 1  # the client is in A; the tracking is owned by B
+    p.flash = lambda msg, cat="message": flashed.append(msg)
+    for label, call, request in (
+        ("track", lambda: p.track(), {"mac": "aa:bb:cc:dd:ee:01", "label": "hijack"}),
+        ("track_from_row", lambda: p.track_from_row(), None),
+        ("untrack", lambda: p.untrack("aa:bb:cc:dd:ee:01"), {}),
+        ("move_subnet", lambda: p.move_subnet("aa:bb:cc:dd:ee:01"), {"subnet_id": "1"}),
+    ):
+        flaky = _FlakyOnce([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2}])
+        p._get_db = flaky
+        audits_h.clear()
+        flashed.clear()
+        if label == "track_from_row":
+            p.request = types.SimpleNamespace(form={}, args={"mac": "aa:bb:cc:dd:ee:01", "hostname": "hijack"})
+        else:
+            p.request = types.SimpleNamespace(form=request, args={})
+        call()
+        writes = [k for k in flaky.kinds() if k in ("INSERT", "UPDATE", "DELETE")]
+        check(
+            writes == []
+            and audits_h == []
+            and flashed == ["Could not check the existing record — nothing was changed."],
+            f"{label}: a failed existence lookup refuses, writes nothing and audits nothing (writes={writes}, audits={audits_h}, flashed={flashed})",
+        )
+    p.request = None
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")

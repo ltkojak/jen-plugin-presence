@@ -1,5 +1,24 @@
 # Presence Plugin — Changelog
 
+## [1.2.1] - 2026-10-07
+
+Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: a failed existence lookup is no longer read as "no such device"
+
+Tracking, untracking and moving a device start by looking up whether it is already tracked, and the answer decides who may touch
+it. That lookup returned `None` both when there was no such row and when the SELECT itself failed, so with the database failing for
+that one statement `track` carried on as if the device were new, judged it on the client's current subnet, and its upsert relabelled a
+row owned by a subnet the caller cannot see. The lookup now has three outcomes (found, not found, failed): on a failure the route
+flashes *Could not check the existing record — nothing was changed*, logs, writes nothing and audits nothing. The same applies to
+untrack and move.
+
+### Changed: the module's design notes state the stored-object contract
+
+The "who may do what" paragraph at the top of the file still said a tracked device belongs to the subnet its MAC is in now. It now
+says what 1.2.0 made true (the owner subnet, a Move, the current subnet derived and shown only in scope) and points at the plugins
+documentation as the source.
+
 ## [1.2.0] - 2026-10-06
 
 A changed contract, so a minor release; no schema change and `requires_jen` stays 5.68.0. The `subnet_id` column of `pr_tracked`
