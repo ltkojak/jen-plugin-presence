@@ -361,6 +361,7 @@ def main():
     for fn, args in (
         (p.track, ()),
         (p.untrack, ("aa:bb:cc:dd:ee:ff",)),
+        (p.move_subnet, ("aa:bb:cc:dd:ee:ff",)),
         (p.track_from_row, ()),
         (p.add_sink, ()),
         (p.toggle_sink, (1,)),
@@ -662,7 +663,6 @@ def main():
     p._apply_transition = lambda mac, online: applied.append((mac, online))
     p._tracked_macs = lambda: {"aa:bb:cc:dd:ee:01"}
     p._has_active_lease = lambda mac: False
-    p._refresh_subnet = lambda mac: None
     for recorded, kind, expect in (
         (True, "lease.new", []),
         (False, "lease.new", [("aa:bb:cc:dd:ee:01", True)]),
@@ -688,38 +688,147 @@ def main():
         p._has_active_lease = lambda mac, has_lease=has_lease: has_lease
         p._on_lease_event({"mac": "aa:bb:cc:dd:ee:01", "kind": "lease.expired"})
         check(applied == expect, f"_on_lease_event: lease.expired with another active lease={has_lease} -> {expect}")
-    # (c) the subnet is refreshed on every handled event, even when nothing transitions
-    refreshed = []
-    p._refresh_subnet = lambda mac: refreshed.append(mac)
-    p._recorded_online = lambda mac: True
-    p._has_active_lease = lambda mac: True
-    p._on_lease_event({"mac": "aa:bb:cc:dd:ee:01", "kind": "lease.new"})
-    p._on_lease_event({"mac": "aa:bb:cc:dd:ee:01", "kind": "lease.expired"})
+    # (c) v1.2.0: a lease event updates STATE only - the owner subnet is never re-filed under the client's current one
     check(
-        len(refreshed) == 2,
-        "_on_lease_event: pr_tracked.subnet_id is refreshed on every handled event, transition or not",
+        not hasattr(p, "_refresh_subnet"),
+        "_refresh_subnet is deleted: no code path re-files a tracking under the client's current subnet",
     )
-    refreshed.clear()
+    applied.clear()
     p._on_lease_event({"mac": "aa:bb:cc:dd:ee:77", "kind": "lease.new"})
-    check(refreshed == [], "_on_lease_event: an untracked MAC is ignored entirely")
+    check(applied == [], "_on_lease_event: an untracked MAC is ignored entirely")
     # the REAL functions, on a fresh load (the tests above replaced several on `p`)
     fresh = load_plugin()
-
-    # the move A -> B: the stored subnet follows the client
-    fresh._current_subnet_for_mac = lambda mac: 2
-    fdb = FakeDB()
-    fresh._get_db = lambda: fdb
-    fresh._refresh_subnet("aa:bb:cc:dd:ee:01")
-    upd = [s for s in fdb.statements if s[0] == "UPDATE"]
+    lease_p = load_plugin()  # its own copy: the checks below keep using `fresh` with its real functions
+    # the client has moved to subnet 2; a lease event of every kind must leave pr_tracked alone
+    lease_p._current_subnet_for_mac = lambda mac: 2
+    owner_fdb = FakeDB()
+    lease_p._get_db = lambda: owner_fdb
+    lease_p._tracked_macs = lambda: {"aa:bb:cc:dd:ee:01"}
+    lease_p._recorded_online = lambda mac: None
+    lease_p._has_active_lease = lambda mac: False
+    moved_applied = []
+    lease_p._apply_transition = lambda mac, online: moved_applied.append((mac, online))
+    for kind in ("lease.new", "lease.ip_changed", "lease.expired"):
+        lease_p._on_lease_event({"mac": "aa:bb:cc:dd:ee:01", "kind": kind})
     check(
-        len(upd) == 1 and upd[0][2][0] == 2 and "pr_tracked" in upd[0][1],
-        "_refresh_subnet: a client that moved to subnet 2 is re-filed under subnet 2",
+        len(moved_applied) == 3 and owner_fdb.statements == [],
+        f"_on_lease_event: three lease events for a client now in subnet 2 change state and write NOTHING to the database (got {owner_fdb.statements})",
     )
-    fresh._current_subnet_for_mac = lambda mac: None
-    fdb = FakeDB()
-    fresh._get_db = lambda: fdb
-    fresh._refresh_subnet("aa:bb:cc:dd:ee:01")
-    check(fdb.statements == [], "_refresh_subnet: a MAC with no known subnet keeps its last one")
+
+    # ── 1.2.0: ownership and location are separate ───────────────────────────
+    import ipaddress as _ip
+
+    names = {1: {"name": "A", "cidr": "10.1.0.0/24"}, 2: {"name": "B", "cidr": "10.2.0.0/24"}}
+    real_is_admin, real_mark = p._is_admin, p._mark_lease_based
+    p._subnet_map = lambda: names
+    p._mark_lease_based = lambda rows: rows
+    p._is_admin = lambda: False
+    p.render_template = lambda name, **kw: kw
+    owned_b = {
+        "mac": "aa:bb:cc:dd:ee:01",
+        "label": "tv",
+        "subnet_id": 2,
+        "online": True,
+        "since": None,
+        "last_seen": None,
+    }
+    p._tracked_rows = lambda: [dict(owned_b)]
+    p._current_subnet_for_mac = lambda mac: 1  # tracked in B, and the client has since moved to A
+    for label, can, expected in (
+        ("an A-scoped caller", only_one, []),
+        (
+            "a B-scoped caller: the owner sees it, and is not told the client is in A",
+            lambda sid: sid == 2,
+            [("tv", "")],
+        ),
+        ("an unrestricted caller: sees it and where the client is now", everything, [("tv", "A (10.1.0.0/24)")]),
+    ):
+        p._can = can
+        got = [(r["label"], r["now_in"]) for r in p.index()["rows"]]
+        check(got == expected, f"index: tracked in B, client now in A - {label} gets {expected} (got {got})")
+    p._can = only_one
+    owned_a = dict(owned_b, mac="aa:bb:cc:dd:ee:02", label="phone", subnet_id=1)
+    p._tracked_rows = lambda: [dict(owned_a)]
+    p._current_subnet_for_mac = lambda mac: 2  # tracked in A, now in B
+    page = p.index()
+    check(
+        [(r["label"], r["subnet_name"], r["now_in"]) for r in page["rows"]] == [("phone", "A", "")],
+        "index: tracked in A, client now in B - an A caller keeps it, filed under A, with no word of B",
+    )
+    p._is_admin = lambda: True
+    p._sink_rows = list
+    p._candidate_hosts = list
+    p._can = lambda sid: sid in (1, 2)
+    check(
+        [c["id"] for c in p.index()["move_choices"]] == [1, 2],
+        "index: an admin is offered the subnets they can see as move targets",
+    )
+    p._can = only_one
+    check(
+        [c["id"] for c in p.index()["move_choices"]] == [1],
+        "index: ...and only those (a scoped admin is not offered B)",
+    )
+    p._is_admin, p._mark_lease_based = real_is_admin, real_mark
+
+    # the explicit move: both subnets in scope, audited, and nothing else changes the owner subnet
+    check(
+        p.move_refusal(2, 1, only_one, names) == "Device not found."
+        and p.move_refusal(None, 1, only_one, names) == "Device not found."
+        and p.move_refusal(1, 2, only_one, names) == "That subnet is not available to you."
+        and p.move_refusal(1, 99, everything, names) == "That subnet is not available to you."
+        and p.move_refusal(1, None, everything, names) == "That subnet is not available to you."
+        and p.move_refusal(1, 1, only_one, names) == "That device already belongs to that subnet."
+        and p.move_refusal(1, 2, lambda s: s in (1, 2), names) == ""
+        and p.move_refusal(None, 1, everything, names) == "",
+        "move_refusal: both subnets must be the caller's, the target must be a known subnet, and a no-op is not a move",
+    )
+    audits = []
+    p._audit = lambda action, target, detail: audits.append((action, target, detail))
+    for label, can, owner, target, moved in (
+        ("both subnets in scope", lambda sid: sid in (1, 2), 1, "2", True),
+        ("a caller scoped to A moving A's device to B", only_one, 1, "2", False),
+        ("a caller scoped to B, the device owned by A", lambda sid: sid == 2, 1, "2", False),
+        ("a target that is not a number", everything, 1, "x", False),
+        ("a target Jen does not know", everything, 1, "77", False),
+    ):
+        audits.clear()
+        fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": owner}])
+        p._get_db = lambda fdb=fdb: fdb
+        p._can = can
+        p.request = types.SimpleNamespace(form={"subnet_id": target}, args={})
+        p.move_subnet("aa:bb:cc:dd:ee:01")
+        updates = [s for s in fdb.statements if s[0] == "UPDATE"]
+        check(
+            bool(updates) == moved and (updates[0][2] == (2, "aa:bb:cc:dd:ee:01") if moved else True),
+            f"move_subnet: {label} -> {'moved' if moved else 'refused, nothing written'} (got {fdb.kinds()})",
+        )
+        check(
+            (audits == [("PRESENCE_MOVE", "aa:bb:cc:dd:ee:01", "subnet_id 1 -> 2")]) == moved
+            and (moved or audits == []),
+            f"move_subnet: {label} -> {'one audit row naming both subnets' if moved else 'no audit row'} (got {audits})",
+        )
+    fdb = FakeDB([None])
+    p._get_db = lambda fdb=fdb: fdb
+    p._can = everything
+    p.request = types.SimpleNamespace(form={"subnet_id": "2"}, args={})
+    p.move_subnet("aa:bb:cc:dd:ee:01")
+    check("UPDATE" not in fdb.kinds(), "move_subnet: a device that is not tracked is not found")
+    p.request = None
+
+    # the neighbour pass asks where the device is NOW; the owner subnet is only the last resort
+    p._tracked_subnets = lambda: {"aa:bb:cc:dd:ee:01": 2}
+    p._current_ip_hostname_bulk = lambda macs: dict.fromkeys(macs, (None, None))
+    nets = [_ip.IPv4Network("10.1.0.0/24")]
+    p._current_subnet_for_mac = lambda mac: 1
+    check(
+        p._local_macs({"aa:bb:cc:dd:ee:01"}, nets) == {"aa:bb:cc:dd:ee:01"},
+        "_local_macs: a device owned by subnet 2 that is NOW in the Jen host's own subnet 1 is local",
+    )
+    p._current_subnet_for_mac = lambda mac: None
+    check(
+        p._local_macs({"aa:bb:cc:dd:ee:01"}, nets) == set(),
+        "_local_macs: with no current subnet the owner subnet is the fallback (2: not local)",
+    )
 
     # the two-leases case: one of two leases ending leaves the device online
     for n, expect in ((2, True), (1, True), (0, False)):

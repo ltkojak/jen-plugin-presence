@@ -42,6 +42,8 @@
         <td data-m="primary">
             {{ r.label or r.mac }}
             {% if r.label %}<span class="small muted mono">({{ r.mac }})</span>{% endif %}
+            {% if r.subnet_name %}<span class="small muted">{{ r.subnet_name }}</span>{% endif %}
+            {% if r.now_in %}<span class="small muted">now in {{ r.now_in }}</span>{% endif %}
         </td>
         <td data-m="badge">
             {% if r.online %}<span class="ok">{{ icon("circle-check") }} Online</span>
@@ -52,6 +54,14 @@
         <td class="small muted" data-m="hide">{{ r.since | utcfmt if r.since else '—' }}</td>
         <td data-m="trailing">
             {% if is_admin %}
+            {% if move_choices %}
+            <form method="POST" action="{{ url_for('presence.move_subnet', mac=r.mac) }}" class="contents"
+                  data-confirm="Move {{ r.label or r.mac }} to the subnet you picked?">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <select name="subnet_id" aria-label="Move to subnet">{% for c in move_choices %}<option value="{{ c.id }}"{% if c.id == r.subnet_id %} selected{% endif %}>{{ c.name }}</option>{% endfor %}</select>
+                <button type="submit" class="btn btn-sm btn-secondary" title="Move to this subnet">Move</button>
+            </form>
+            {% endif %}
             <form method="POST" action="{{ url_for('presence.untrack', mac=r.mac) }}" class="contents"
                   data-confirm="Stop tracking {{ r.label or r.mac }}?">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

@@ -1,5 +1,33 @@
 # Presence Plugin — Changelog
 
+## [1.2.0] - 2026-10-06
+
+A changed contract, so a minor release; no schema change and `requires_jen` stays 5.68.0. The `subnet_id` column of `pr_tracked`
+keeps its name and now means one thing: the **owner subnet** of the tracking.
+
+### Changed: a tracked device's subnet no longer follows the client
+
+Presence had two contradictory ideas about `pr_tracked.subnet_id`. 1.1.1 judged the Investigation card on it as a stored subnet
+(who may see this tracking), while every lease event rewrote it to the client's current subnet, so a device tracked in subnet B
+was handed to subnet A by its next lease and its label and state became visible to a caller scoped to A: the "stored" subnet
+*was* the current one. The two are now separate. The column is the owner subnet: written when the device is tracked, changed
+only by an explicit move, never by a lease event (`_refresh_subnet` is gone; a lease event updates state only). The page, relabel,
+untrack, the stored state and the Investigation card all judge on it. Where the device is now is derived when the page is read and
+shown as *now in …* only to a caller who may see that subnet.
+
+### Added: Move, the one way to change the owner subnet
+
+An admin who can see both the subnet a device is filed under and the subnet it is going to can move it from the tracked-device
+list; the move is audited with both subnet ids. A device filed under a subnet the caller cannot see is *not found* for them, a
+target the caller cannot see (or Jen does not know) is refused, and relabelling a tracked device never changes its subnet.
+Devices that had followed a client before this release keep the subnet they have; one that should belong somewhere else is moved
+by hand.
+
+### Fixed: the neighbour pass asks where the device is now
+
+Whether a tracked device is on a segment the Jen host is attached to (and so can be seen in its neighbour table) is judged on its
+current address, then its current subnet, and only last on the owner subnet, which no longer follows it.
+
 ## [1.1.1] - 2026-10-06
 
 Fix to the investigation provider added in 1.1.0. No change to what Jen needs: `requires_jen` stays 5.68.0.

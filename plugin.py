@@ -930,35 +930,14 @@ def _has_active_lease(mac):
             kdb.close()
 
 
-def _refresh_subnet(mac):
-    """Follow the client: `pr_tracked.subnet_id` is what the page and untrack authorise on, and it was
-    written once, when the device was tracked, and never again - a client that moved to another subnet
-    stayed visible to (and removable by) a user scoped to the old one. Updated from the MAC's current
-    subnet on every lease event handled here; a MAC with no known subnet keeps its last one."""
-    subnet_id = _current_subnet_for_mac(mac)
-    if subnet_id is None:
-        return
-    db = None
-    try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute(
-                "UPDATE pr_tracked SET subnet_id=%s WHERE mac=%s AND (subnet_id IS NULL OR subnet_id<>%s)",
-                (subnet_id, mac, subnet_id),
-            )
-        db.commit()
-    except Exception as e:
-        logger.warning(f"Presence: could not refresh the subnet of {mac}: {e}")
-    finally:
-        if db:
-            db.close()
-
-
 def _on_lease_event(event):
+    # v1.2.0 - a lease event updates STATE only. `pr_tracked.subnet_id` is the OWNER subnet, written when the device is
+    # tracked and changed only by an explicit, scoped move (`move_subnet`); the old `_refresh_subnet` re-filed it under the
+    # client's current subnet on every event, so a device tracked in B was handed to A by its next lease and its label and
+    # state showed to an A-scoped user - while the card, the page and untrack all judged on that column as if it were stored.
     mac = (event.get("mac") or "").lower()
     if not mac or mac not in _tracked_macs():
         return
-    _refresh_subnet(mac)
     kind = event.get("kind")
     if kind == "lease.expired":
         # One lease ending is not the client leaving: a device that moved subnet, or holds a second lease,
@@ -1026,7 +1005,12 @@ def _local_macs(tracked, local_nets):
     out = set()
     for mac in tracked:
         ip, _hostname = ips.get(mac, (None, None))
-        if mac_is_local(ip, cidrs.get(subnets.get(mac)), local_nets):
+        # whether the device is on the Jen host's segment is a question about where it is NOW (its address; failing that
+        # its current subnet), not about who owns the tracking: the owner subnet is only the last resort
+        where = None if ip else _current_subnet_for_mac(mac)
+        if where is None:
+            where = subnets.get(mac)
+        if mac_is_local(ip, cidrs.get(where), local_nets):
             out.add(mac)
     return out
 
@@ -1287,13 +1271,57 @@ def _sink_rows():
             db.close()
 
 
+def _where_now(mac, owner_subnet_id, subnet_map):
+    """Where the device is NOW, as text, for a row owned by `owner_subnet_id` - "" when it is still there, is not known, or is a
+    subnet the caller may not see (naming a subnet is access to it). Derived at read time and only ever shown."""
+    try:
+        current = _current_subnet_for_mac(mac)
+    except Exception as e:
+        logger.error(f"Presence: could not work out where {mac} is now: {e}")
+        return ""
+    if current is None or current == owner_subnet_id or not _can(current):
+        return ""
+    return subnet_label(current, subnet_map)
+
+
+def move_refusal(old_subnet_id, new_subnet_id, can, subnet_map):
+    """Pure: why a tracked device may NOT be moved from the owner subnet `old_subnet_id` to `new_subnet_id`, or "". The caller
+    needs BOTH subnets (the device is theirs, and so is where it is going); the target must be a subnet Jen knows; moving a
+    device to the subnet it already has is not a move. `can` is the caller's predicate on a subnet id (None is never allow)."""
+    if not can(old_subnet_id):
+        return "Device not found."
+    if new_subnet_id not in (subnet_map or {}) or not can(new_subnet_id):
+        return "That subnet is not available to you."
+    if new_subnet_id == old_subnet_id:
+        return "That device already belongs to that subnet."
+    return ""
+
+
 @bp.route("/")
 @login_required
 def index():
-    rows = _mark_lease_based([r for r in _tracked_rows() if _can(r["subnet_id"])])
+    # v1.2.0 - judged on the OWNER subnet (`pr_tracked.subnet_id`), which only a track or an explicit move writes; where the
+    # device is now is derived here and shown only when the caller may see that subnet
+    rows = [r for r in _tracked_rows() if _can(r["subnet_id"])]
+    subnet_map = _subnet_map()
+    for r in rows:
+        sid = r["subnet_id"]
+        r["subnet_name"] = subnet_map.get(sid, {}).get("name", "") if sid else ""
+        r["now_in"] = _where_now(r["mac"], sid, subnet_map)
+    rows = _mark_lease_based(rows)
+    move_choices = (
+        [
+            {"id": sid, "name": info.get("name") or info.get("cidr") or str(sid)}
+            for sid, info in subnet_map.items()
+            if _can(sid)
+        ]
+        if _is_admin()
+        else []
+    )
     return render_template(
         "presence/index.html",
         rows=rows,
+        move_choices=move_choices,
         sinks=_sink_rows() if _is_admin() else [],
         candidates=_candidate_hosts() if _is_admin() else [],
         is_admin=_is_admin(),
@@ -1321,9 +1349,10 @@ def _existing_tracked(mac):
 
 def _track(mac, label, source):
     """Track `mac` (or relabel it if it is already tracked). Returns a refusal message, or "".
-    The subnet is the MAC's own, worked out here. An existing row is authorised on ITS subnet first
-    and only its label is ever changed: the upsert used to overwrite `subnet_id`, so a scoped admin
-    who knew a hidden device's MAC could re-track it into their own subnet and read its state."""
+    The OWNER subnet is the MAC's own at the moment it is tracked, worked out here. An existing row is
+    authorised on ITS subnet first and only its label is ever changed (relabel): the upsert used to overwrite
+    `subnet_id`, so a scoped admin who knew a hidden device's MAC could re-track it into their own subnet and read
+    its state. The owner subnet moves only through `move_subnet`."""
     existing = _existing_tracked(mac)
     if existing is not None:
         if not _can(existing["subnet_id"]):
@@ -1370,6 +1399,43 @@ def track():
         flash(refusal, "error")
     else:
         flash(f"Now tracking {label or mac}.", "success")
+    return redirect(url_for("presence.index"))
+
+
+@bp.route("/move/<mac>", methods=["POST"])
+@login_required
+def move_subnet(mac):
+    """Re-file a tracked device under another subnet - the ONLY way its owner subnet changes after it is tracked (v1.2.0). The
+    caller must be able to see both the subnet it is in and the one it is going to; the move is audited with both."""
+    if not _require_write():
+        return redirect(url_for("presence.index"))
+    mac = _normalize_mac(mac)
+    row = _existing_tracked(mac) if mac else None
+    if row is None:
+        flash("Device not found.", "error")
+        return redirect(url_for("presence.index"))
+    try:
+        target = int(request.form.get("subnet_id", ""))
+    except (TypeError, ValueError):
+        target = None
+    refusal = move_refusal(row["subnet_id"], target, _can, _subnet_map())
+    if refusal:
+        flash(refusal, "error")
+        return redirect(url_for("presence.index"))
+    db = None
+    try:
+        db = _get_db()
+        with db.cursor() as cur:
+            cur.execute("UPDATE pr_tracked SET subnet_id=%s WHERE mac=%s", (target, mac))
+        db.commit()
+        flash("Moved.", "success")
+        _audit("PRESENCE_MOVE", mac, f"subnet_id {row['subnet_id']} -> {target}")
+    except Exception as e:
+        logger.error(f"Presence: could not move {mac}: {e}")
+        flash(f"Could not move {mac}; the details are in Jen's log.", "error")
+    finally:
+        if db:
+            db.close()
     return redirect(url_for("presence.index"))
 
 
