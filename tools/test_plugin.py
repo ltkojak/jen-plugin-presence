@@ -463,9 +463,14 @@ def main():
 
     # ── a fake database and request, to run the impure routes ────────────────
     class FakeDB:
-        def __init__(self, selects=None):
+        def __init__(self, selects=None, hook=None):
             self.statements = []
             self.selects = list(selects or [])
+            self.rowcount = 1
+            self.rolled_back = 0
+            self.hook = (
+                hook  # called with (db, kind, sql, params) after the statement is recorded; may raise or set rowcount
+            )
 
         def cursor(self):
             return self
@@ -477,7 +482,14 @@ def main():
             return False
 
         def execute(self, sql, params=()):
-            self.statements.append((sql.split()[0].upper(), sql, params))
+            kind = sql.split()[0].upper()
+            self.statements.append((kind, sql, params))
+            self.rowcount = 1
+            if self.hook:
+                self.hook(self, kind, sql, params)
+
+        def rollback(self):
+            self.rolled_back += 1
 
         def fetchone(self):
             return self.selects.pop(0) if self.selects else None
@@ -598,15 +610,17 @@ def main():
         len(ins) == 1 and ins[0][2][2] == 1,
         "track: a new device is stored on the MAC's own subnet (1), whatever address was typed",
     )
-    check(
-        "subnet_id=VALUES" not in ins[0][1], "track: the upsert can only change the label — it never rewrites subnet_id"
-    )
+    check("ON DUPLICATE" not in ins[0][1], "track: a new device is a plain INSERT, never an upsert (1.2.2)")
     fdb = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 1}])
     p._get_db = lambda: fdb
     p.track()
-    ins = [s for s in fdb.statements if s[0] == "INSERT"]
+    upd = [s for s in fdb.statements if s[0] == "UPDATE"]
     check(
-        len(ins) == 1 and ins[0][2][2] == 1, "track: re-tracking an accessible device keeps its subnet and relabels it"
+        len(upd) == 1
+        and upd[0][2] == ("Phone", "aa:bb:cc:dd:ee:01", 1)
+        and "INSERT" not in fdb.kinds()
+        and "subnet_id=%s" not in upd[0][1].split("WHERE")[0],
+        "track: re-tracking an accessible device keeps its subnet and relabels it - under the judged owner, never setting subnet_id",
     )
 
     # ── 1.0.1: track-row ignores the query-string subnet ─────────────────────
@@ -799,7 +813,7 @@ def main():
         p.move_subnet("aa:bb:cc:dd:ee:01")
         updates = [s for s in fdb.statements if s[0] == "UPDATE"]
         check(
-            bool(updates) == moved and (updates[0][2] == (2, "aa:bb:cc:dd:ee:01") if moved else True),
+            bool(updates) == moved and (updates[0][2] == (2, "aa:bb:cc:dd:ee:01", owner) if moved else True),
             f"move_subnet: {label} -> {'moved' if moved else 'refused, nothing written'} (got {fdb.kinds()})",
         )
         check(
@@ -1241,7 +1255,7 @@ def main():
         "test_sink: a bug in _send_to_sink (KeyError, not _PresenceError) is NOT swallowed as 'Test failed' — it propagates",
     )
 
-    # ── _existing_tracked: a DB failure degrades to 'no existing row', never an uncaught crash ──
+    # ── _lock_tracked: three states - a row, None, or a FAILED lookup that raises _LookupFailed (never "absent") ──
     class _BadTrackedDB:
         def cursor(self):
             raise RuntimeError("db down")
@@ -1250,19 +1264,31 @@ def main():
             pass
 
     fresh._get_db = lambda: _BadTrackedDB()
+    try:
+        fresh._open_txn()
+        opened = True
+    except fresh._LookupFailed:
+        opened = False
     check(
-        fresh._existing_tracked("aa:bb:cc:dd:ee:01") is fresh.LOOKUP_FAILED,
-        "_existing_tracked: a DB failure is LOOKUP_FAILED (not None, and not an uncaught crash)",
+        not opened,
+        "_open_txn: not being able to reach the database is a FAILED lookup (not None, not a bare driver error)",
     )
-    fresh._get_db = lambda: FakeDB([None])
+    failing_cur = FakeDB(hook=lambda db, kind, sql, params: (_ for _ in ()).throw(RuntimeError("db down")))
+    try:
+        fresh._lock_tracked(failing_cur, "aa:bb:cc:dd:ee:01")
+        locked = "returned"
+    except fresh._LookupFailed:
+        locked = "failed"
+    check(locked == "failed", "_lock_tracked: a SELECT that raises is a FAILED lookup")
     check(
-        fresh._existing_tracked("aa:bb:cc:dd:ee:01") is None,
-        "_existing_tracked: a lookup that worked and found nothing is None",
+        fresh._lock_tracked(FakeDB([None]), "aa:bb:cc:dd:ee:01") is None,
+        "_lock_tracked: a lookup that worked and found nothing is None",
     )
-    fresh._get_db = lambda: FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2}])
+    locking = FakeDB([{"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2}])
     check(
-        fresh._existing_tracked("aa:bb:cc:dd:ee:01") == {"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2},
-        "_existing_tracked: a row that exists is the row",
+        fresh._lock_tracked(locking, "aa:bb:cc:dd:ee:01") == {"mac": "aa:bb:cc:dd:ee:01", "subnet_id": 2}
+        and "FOR UPDATE" in locking.statements[0][1],
+        "_lock_tracked: a row that exists is the row, read FOR UPDATE",
     )
 
     # ── 1.2.1: three-state lookups. A hidden object, a client visible in A, the FIRST statement raising, every later write able to
@@ -1311,6 +1337,141 @@ def main():
             and audits_h == []
             and flashed == ["Could not check the existing record — nothing was changed."],
             f"{label}: a failed existence lookup refuses, writes nothing and audits nothing (writes={writes}, audits={audits_h}, flashed={flashed})",
+        )
+    p.request = None
+
+    # ── 1.2.2: judging and writing are ONE transaction. A row owned by B that appears or changes between the judgement and the write
+    #    is never modified: the write is conditioned on the judged owner, the count is checked, a lost insert race is re-judged ──
+    class _Err(Exception):
+        pass
+
+    def driver_error(code):
+        err = _Err("driver")
+        err.args = (code, "driver")
+        return err
+
+    def mutations(db):
+        return [k for k in db.kinds() if k in ("INSERT", "UPDATE", "DELETE")]
+
+    p._can = only_one  # an admin of subnet 1 (A); subnet 2 (B) is hidden from them
+    p._current_subnet_for_mac = lambda mac: 1
+    p._subnet_map = lambda: {1: {"name": "A", "cidr": "10.1.0.0/24"}, 2: {"name": "B", "cidr": "10.2.0.0/24"}}
+    p._require_write = lambda: True
+    mac1 = "aa:bb:cc:dd:ee:01"
+
+    def became_b(db, kind, sql, params):
+        if kind in ("UPDATE", "DELETE"):
+            db.rowcount = 0  # nothing matches "subnet_id <=> 1" any more
+            db.selects[:] = [{"mac": mac1, "subnet_id": 2}]
+
+    for label, call, form in (
+        ("track", lambda: p.track(), {"mac": mac1, "label": "x"}),
+        ("move_subnet", lambda: p.move_subnet(mac1), {"subnet_id": "2"}),
+        ("untrack", lambda: p.untrack(mac1), {}),
+    ):
+        p._can = (lambda sid: sid in (1, 2)) if label == "move_subnet" else only_one
+        race = FakeDB([{"mac": mac1, "subnet_id": 1}], hook=became_b)
+        p._get_db = lambda race=race: race
+        audits_h.clear()
+        flashed.clear()
+        p.request = types.SimpleNamespace(form=form, args={})
+        call()
+        check(
+            flashed == [p.CHANGED_UNDERFOOT] and race.rolled_back >= 1 and audits_h == [],
+            f"{label}: the row became B's between judge and write - refused, rolled back, nothing audited (flashed={flashed}, audits={audits_h})",
+        )
+        check(
+            all("FOR UPDATE" in s[1] for s in race.statements if s[0] == "SELECT"),
+            f"{label}: every SELECT that judges the row is FOR UPDATE",
+        )
+        check(
+            all(
+                "subnet_id <=> %s" in s[1]
+                for s in race.statements
+                if s[0] in ("UPDATE", "DELETE") and "pr_tracked" in s[1]
+            ),
+            f"{label}: every write to pr_tracked carries the judged owner as a predicate",
+        )
+    p._can = only_one
+    # the label already is what is stored: MySQL counts 0 CHANGED rows, which is a success while the owner is unchanged
+    same = FakeDB(
+        [{"mac": mac1, "subnet_id": 1}],
+        hook=lambda db, kind, sql, params: (
+            (setattr(db, "rowcount", 0), db.selects.__setitem__(slice(None), [{"mac": mac1, "subnet_id": 1}]))
+            if kind == "UPDATE"
+            else None
+        ),
+    )
+    p._get_db = lambda: same
+    flashed.clear()
+    audits_h.clear()
+    p.request = types.SimpleNamespace(form={"mac": mac1, "label": "x"}, args={})
+    p.track()
+    check(
+        flashed == ["Now tracking x."] and same.rolled_back == 0 and [a[0] for a in audits_h] == ["PRESENCE_TRACK"],
+        f"track: re-saving the label it already has (0 changed rows) is still a success (flashed={flashed})",
+    )
+
+    # a new MAC: the INSERT loses the race (1062) to a B-owned row - the winner is locked and judged, never overwritten
+    def lose(owner, code=1062):
+        def hook(db, kind, sql, params):
+            if kind == "INSERT":
+                db.selects[:] = [{"mac": mac1, "subnet_id": owner}]
+                raise driver_error(code)
+
+        return hook
+
+    lost = FakeDB([], hook=lose(2))
+    p._get_db = lambda: lost
+    flashed.clear()
+    audits_h.clear()
+    p.request = types.SimpleNamespace(form={"mac": mac1, "label": "hijack"}, args={})
+    p.track()
+    check(
+        mutations(lost) == ["INSERT"]
+        and flashed == ["That device is not on a subnet you can access."]
+        and audits_h == [],
+        f"track: lost the INSERT race to a B-owned row - judged again, refused, never UPDATEd (got {mutations(lost)}, {flashed})",
+    )
+    lost_a = FakeDB([], hook=lose(1))
+    p._get_db = lambda: lost_a
+    flashed.clear()
+    p.track()
+    check(
+        mutations(lost_a) == ["INSERT", "UPDATE"]
+        and lost_a.statements[-1][2][-1] == 1
+        and flashed == ["Now tracking hijack."],
+        f"track: lost the INSERT race to a row in the caller's own subnet - relabelled under the owner predicate (got {mutations(lost_a)})",
+    )
+    dead = FakeDB([], hook=lose(2, code=1213))
+    p._get_db = lambda: dead
+    flashed.clear()
+    p.track()
+    check(
+        mutations(dead) == ["INSERT"]
+        and dead.rolled_back >= 1
+        and flashed == ["That device is not on a subnet you can access."],
+        f"track: a deadlocked INSERT is rolled back and the winner (B's) re-judged and refused (got {mutations(dead)}, {flashed})",
+    )
+
+    # ── 1.2.2: the transition event carries the OWNER subnet (it carried none, so the owner-scoped user never saw it) ──
+    emitted_t = []
+    q = load_plugin()  # an untouched copy: `p._apply_transition` was replaced by a recorder above
+    sys.modules["jen.plugin_api"].emit = lambda kind, **kw: emitted_t.append((kind, kw))
+    q._get_db = lambda: FakeDB([])
+    owner_rows = {mac1: ("Phone", 1), "aa:bb:cc:dd:ee:02": ("Hidden", None)}
+    q._tracked_label_and_subnet = lambda mac: owner_rows.get(mac, ("", None))
+    q._current_ip_hostname = lambda mac: (None, None)
+    q._enabled_sinks = list
+    q._audit = lambda *a: None
+    for mac, expect in ((mac1, 1), ("aa:bb:cc:dd:ee:02", None), ("aa:bb:cc:dd:ee:03", None)):
+        emitted_t.clear()
+        q._apply_transition(mac, True)
+        check(
+            len(emitted_t) == 1
+            and emitted_t[0][0] == "plugin.presence.transition"
+            and emitted_t[0][1].get("subnet_id") == expect,
+            f"_apply_transition: the event for {mac} carries the owner subnet {expect} (got {emitted_t})",
         )
     p.request = None
 

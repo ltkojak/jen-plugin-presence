@@ -90,7 +90,11 @@ time and shown only to a caller who may see that subnet; it never widens access.
 MAC that is already tracked authorises the existing row first and only changes its label.
 A device with no owner subnet is for unrestricted callers only. A lookup that decides
 whether a row exists has three outcomes - found, not found, failed - and a failed one
-refuses without writing or auditing anything (v1.2.1).
+refuses without writing or auditing anything (v1.2.1). Judging and writing are ONE
+transaction (v1.2.2): the row is read FOR UPDATE, judged, and written with the judged owner as
+a predicate and the count checked (track, relabel, move, untrack); a new row is a plain INSERT
+whose lost race is judged again on the row that won. The transition event carries the owner
+subnet, so the owner-scoped user sees their own device go online and offline in Timeline.
 
 **One connect-publish-disconnect cycle per transition.** This plugin
 never holds an MQTT connection open — each transition opens a fresh
@@ -783,16 +787,17 @@ def _clear_sink_error(sink_id):
 # ── Transitions ───────────────────────────────────────────────────────────────
 
 
-def _tracked_label(mac):
+def _tracked_label_and_subnet(mac):
+    """(label, owner subnet id) of the tracked row for `mac`; ("", None) when there is none or the lookup fails."""
     db = None
     try:
         db = _get_db()
         with db.cursor() as cur:
-            cur.execute("SELECT label FROM pr_tracked WHERE mac=%s", (mac,))
+            cur.execute("SELECT label, subnet_id FROM pr_tracked WHERE mac=%s", (mac,))
             row = cur.fetchone()
-            return row["label"] if row else ""
+            return (row["label"], row["subnet_id"]) if row else ("", None)
     except Exception:
-        return ""
+        return "", None
     finally:
         if db:
             db.close()
@@ -867,7 +872,7 @@ def _apply_transition(mac, online):
         if db:
             db.close()
 
-    label = _tracked_label(mac)
+    label, owner_subnet = _tracked_label_and_subnet(mac)
     ip, hostname = _current_ip_hostname(mac)
     since_iso = datetime.now(timezone.utc).isoformat()
     # v1.0.3 — queued to the plugin's own worker thread instead of sent inline here; see
@@ -878,7 +883,9 @@ def _apply_transition(mac, online):
     try:
         from jen.plugin_api import emit
 
-        emit("plugin.presence.transition", mac=mac, detail="online" if online else "offline")
+        # v1.2.2: the event carries the tracking's OWNER subnet, so the owner-scoped user sees their own device go online and
+        # offline in Timeline (it carried none: unrestricted viewers only). A row with no owner subnet stays unrestricted-only.
+        emit("plugin.presence.transition", mac=mac, subnet_id=owner_subnet, detail="online" if online else "offline")
     except Exception as e:
         logger.warning(f"Presence: could not emit transition event: {e}")
 
@@ -1335,55 +1342,97 @@ def index():
     )
 
 
-LOOKUP_FAILED = object()  # the existence lookup itself failed: neither "found" nor "not found"
 LOOKUP_REFUSAL = "Could not check the existing record — nothing was changed."
+CHANGED_UNDERFOOT = "That device changed while you were saving it — nothing was changed. Try again."
 
 
-def _existing_tracked(mac):
-    """The pr_tracked row for `mac` (found), None (the lookup worked and there is no such row), or LOOKUP_FAILED (the lookup raised).
-    Three states, never two (v1.2.1): a lookup that raises is not "absent". It used to degrade to "no existing row", so with the
-    database failing for this one SELECT, `_track` went on as if the device were new, judged it on the client's CURRENT subnet,
-    and its upsert relabelled a row a hidden subnet owns. Every caller refuses on LOOKUP_FAILED: nothing is written, nothing audited."""
+class _LookupFailed(Exception):
+    """The existence lookup itself raised: the third outcome, neither 'found' nor 'not found' (v1.2.1)."""
+
+
+def _open_txn():
+    """(db, cur) for one judge-and-write transaction. Not being able to reach the database at all is a FAILED lookup too (the third
+    outcome): raises _LookupFailed, never a bare driver error the route would call 'could not track'."""
     db = None
     try:
         db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("SELECT mac, subnet_id FROM pr_tracked WHERE mac=%s", (mac,))
-            return cur.fetchone()
+        return db, db.cursor()
     except Exception as e:
-        logger.warning(f"Presence: could not check for an existing tracked row for {mac}: {e}")
-        return LOOKUP_FAILED
-    finally:
         if db:
             db.close()
+        raise _LookupFailed(str(e)) from e
+
+
+def _lock_tracked(cur, mac):
+    """The pr_tracked row for `mac` read FOR UPDATE inside the caller's transaction (found), or None (the lookup worked and there is
+    no such row). Raises _LookupFailed when the SELECT raises - three states, never two (v1.2.1): a lookup that raises is not "absent".
+    Reading it FOR UPDATE (v1.2.2) is what makes the judgement and the write one transaction: nobody can change or create the row
+    until this request commits, so what was judged is what is written."""
+    try:
+        cur.execute("SELECT mac, subnet_id FROM pr_tracked WHERE mac=%s FOR UPDATE", (mac,))
+        return cur.fetchone()
+    except Exception as e:
+        raise _LookupFailed(str(e)) from e
+
+
+def _save_tracked(db, cur, mac, label, added_by):
+    """Judge and write one tracked row in ONE transaction (v1.2.2). Returns ("ok", "") or ("refused", the flash text); the caller commits
+    or rolls back. Raises _LookupFailed when the first SELECT raises.
+
+    The OWNER subnet is the MAC's own at the moment it is tracked, worked out here. An existing row is authorised on ITS subnet first and
+    only its label is ever changed (`UPDATE ... WHERE mac=%s AND subnet_id <=> owner` - the owner that was judged, the count checked);
+    the owner subnet moves only through `move_subnet`. A new row is a plain INSERT, never `ON DUPLICATE KEY UPDATE`: if another request
+    created it first (1062, or a deadlock 1213 between two inserts of one MAC) the row that WON is locked and judged again."""
+    for attempt in (1, 2):
+        existing = _lock_tracked(cur, mac)
+        if existing is not None:
+            owner = existing["subnet_id"]
+            if not _can(owner):
+                return "refused", "That device is not on a subnet you can access."
+            cur.execute("UPDATE pr_tracked SET label=%s WHERE mac=%s AND subnet_id <=> %s", (label, mac, owner))
+            if cur.rowcount == 1:
+                return "ok", ""
+            # 0 rows: the label was already this (MySQL counts CHANGED rows), or the row is no longer the one that was judged.
+            # Look again under the lock this transaction holds; only the same owner is a success.
+            again = _lock_tracked(cur, mac)
+            if again is not None and again["subnet_id"] == owner:
+                return "ok", ""
+            return "refused", CHANGED_UNDERFOOT
+        subnet_id = _current_subnet_for_mac(mac)
+        if not _can(subnet_id):
+            return "refused", "That MAC is not on a subnet you can access."
+        try:
+            cur.execute(
+                "INSERT INTO pr_tracked (mac, label, subnet_id, added_by) VALUES (%s, %s, %s, %s)",
+                (mac, label, subnet_id, added_by),
+            )
+            return "ok", ""
+        except Exception as e:
+            code = getattr(e, "args", (None,))[0]
+            if attempt == 1 and code in (1062, 1213):
+                if code == 1213:
+                    db.rollback()  # InnoDB already rolled the deadlock victim back
+                continue  # another request created it first: lock and judge the row that won
+            raise
+    return "refused", CHANGED_UNDERFOOT
 
 
 def _track(mac, label, source):
     """Track `mac` (or relabel it if it is already tracked). Returns a refusal message, or "".
-    The OWNER subnet is the MAC's own at the moment it is tracked, worked out here. An existing row is
-    authorised on ITS subnet first and only its label is ever changed (relabel): the upsert used to overwrite
-    `subnet_id`, so a scoped admin who knew a hidden device's MAC could re-track it into their own subnet and read
-    its state. The owner subnet moves only through `move_subnet`."""
-    existing = _existing_tracked(mac)
-    if existing is LOOKUP_FAILED:
-        return LOOKUP_REFUSAL
-    if existing is not None:
-        if not _can(existing["subnet_id"]):
-            return "That device is not on a subnet you can access."
-        subnet_id = existing["subnet_id"]
-    else:
-        subnet_id = _current_subnet_for_mac(mac)
-        if not _can(subnet_id):
-            return "That MAC is not on a subnet you can access."
+    One transaction (`_save_tracked`): the row is read FOR UPDATE, judged on ITS subnet, and written under that owner. The upsert
+    this replaced overwrote `subnet_id`, so a scoped admin who knew a hidden device's MAC could re-track it into their own subnet and
+    read its state; the owner subnet moves only through `move_subnet`."""
     db = None
     try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute(
-                "INSERT INTO pr_tracked (mac, label, subnet_id, added_by) VALUES (%s, %s, %s, %s) "
-                "ON DUPLICATE KEY UPDATE label=VALUES(label)",
-                (mac, label, subnet_id, current_user.username),
-            )
+        try:
+            db, cur = _open_txn()
+            outcome, refusal = _save_tracked(db, cur, mac, label, current_user.username)
+        except _LookupFailed as e:
+            logger.warning(f"Presence: could not check for an existing tracked row for {mac}: {e}")
+            return LOOKUP_REFUSAL
+        if outcome != "ok":
+            db.rollback()
+            return refusal
         db.commit()
         _audit("PRESENCE_TRACK", mac, f"label={label}{source}")
     finally:
@@ -1423,26 +1472,40 @@ def move_subnet(mac):
     if not _require_write():
         return redirect(url_for("presence.index"))
     mac = _normalize_mac(mac)
-    row = _existing_tracked(mac) if mac else None
-    if row is LOOKUP_FAILED:
-        flash(LOOKUP_REFUSAL, "error")
-        return redirect(url_for("presence.index"))
-    if row is None:
+    if not mac:
         flash("Device not found.", "error")
         return redirect(url_for("presence.index"))
     try:
         target = int(request.form.get("subnet_id", ""))
     except (TypeError, ValueError):
         target = None
-    refusal = move_refusal(row["subnet_id"], target, _can, _subnet_map())
-    if refusal:
-        flash(refusal, "error")
-        return redirect(url_for("presence.index"))
     db = None
     try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("UPDATE pr_tracked SET subnet_id=%s WHERE mac=%s", (target, mac))
+        # v1.2.2: ONE transaction - the row is read FOR UPDATE, judged (both subnets), and moved with the judged owner as a
+        # predicate, the count checked
+        try:
+            db, cur = _open_txn()
+            row = _lock_tracked(cur, mac)
+        except _LookupFailed as e:
+            logger.warning(f"Presence: could not check for an existing tracked row for {mac}: {e}")
+            flash(LOOKUP_REFUSAL, "error")
+            return redirect(url_for("presence.index"))
+        if row is None:
+            db.rollback()
+            flash("Device not found.", "error")
+            return redirect(url_for("presence.index"))
+        refusal = move_refusal(row["subnet_id"], target, _can, _subnet_map())
+        if refusal:
+            db.rollback()
+            flash(refusal, "error")
+            return redirect(url_for("presence.index"))
+        cur.execute(
+            "UPDATE pr_tracked SET subnet_id=%s WHERE mac=%s AND subnet_id <=> %s", (target, mac, row["subnet_id"])
+        )
+        if cur.rowcount != 1:
+            db.rollback()
+            flash(CHANGED_UNDERFOOT, "error")
+            return redirect(url_for("presence.index"))
         db.commit()
         flash("Moved.", "success")
         _audit("PRESENCE_MOVE", mac, f"subnet_id {row['subnet_id']} -> {target}")
@@ -1461,19 +1524,29 @@ def untrack(mac):
     if not _require_write():
         return redirect(url_for("presence.index"))
     mac = _normalize_mac(mac)
-    row = _existing_tracked(mac) if mac else None
-    if row is LOOKUP_FAILED:
-        flash(LOOKUP_REFUSAL, "error")
-        return redirect(url_for("presence.index"))
-    if row is None or not _can(row["subnet_id"]):
+    if not mac:
         flash("Device not found.", "error")
         return redirect(url_for("presence.index"))
     db = None
     try:
-        db = _get_db()
-        with db.cursor() as cur:
-            cur.execute("DELETE FROM pr_state WHERE mac=%s", (mac,))
-            cur.execute("DELETE FROM pr_tracked WHERE mac=%s", (mac,))
+        # v1.2.2: ONE transaction - read FOR UPDATE, judged on the row's own subnet, deleted under the judged owner, count checked
+        try:
+            db, cur = _open_txn()
+            row = _lock_tracked(cur, mac)
+        except _LookupFailed as e:
+            logger.warning(f"Presence: could not check for an existing tracked row for {mac}: {e}")
+            flash(LOOKUP_REFUSAL, "error")
+            return redirect(url_for("presence.index"))
+        if row is None or not _can(row["subnet_id"]):
+            db.rollback()
+            flash("Device not found.", "error")
+            return redirect(url_for("presence.index"))
+        cur.execute("DELETE FROM pr_tracked WHERE mac=%s AND subnet_id <=> %s", (mac, row["subnet_id"]))
+        if cur.rowcount != 1:
+            db.rollback()
+            flash(CHANGED_UNDERFOOT, "error")
+            return redirect(url_for("presence.index"))
+        cur.execute("DELETE FROM pr_state WHERE mac=%s", (mac,))
         db.commit()
         flash("No longer tracked.", "success")
         _audit("PRESENCE_UNTRACK", mac, "untracked")

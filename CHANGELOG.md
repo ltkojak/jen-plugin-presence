@@ -1,5 +1,26 @@
 # Presence Plugin — Changelog
 
+## [1.2.2] - 2026-10-07
+
+Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: judging a tracked device and writing it are one transaction
+
+*Track*, *relabel*, *move* and *untrack* each read the row on one connection, judged its owner subnet, and wrote on another. A device
+another admin tracked, moved or removed in the moment between the two was relabelled by the `INSERT ... ON DUPLICATE KEY UPDATE`, moved by
+an `UPDATE ... WHERE mac=...` or deleted by a `DELETE ... WHERE mac=...` that carried no owner condition at all. Each now runs on one
+connection: the row is read `FOR UPDATE` (nobody else can change or create it until the request ends), judged, and written with the judged
+owner as a predicate (`subnet_id <=> owner`) and the count checked. A row that is no longer the one that was judged refuses with *That device
+changed while you were saving it — nothing was changed* and audits nothing. A new device is a plain `INSERT`: if another request created it
+first (duplicate key, or a deadlock between two inserts of one MAC) the row that won is locked and judged again, and a row in a subnet the
+caller cannot see is refused, never relabelled. Not being able to reach the database at all counts as a failed lookup, as 1.2.1 had it.
+
+### Fixed: the online/offline event carried no subnet
+
+`plugin.presence.transition` was written with no subnet, so it appeared only to unrestricted viewers: the account that owns a tracked device
+never saw it go online or offline in Timeline. It now carries the device's owner subnet (a device with no owner subnet stays
+unrestricted-only).
+
 ## [1.2.1] - 2026-10-07
 
 Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
