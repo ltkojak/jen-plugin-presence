@@ -31,7 +31,7 @@ Every sink send has a 10-second timeout; a failure records `last_error` on the s
 
 - **Track** row action on Lease and Device rows, plus a picker (over reservations and leases) on the Presence page itself
 - Respects Jen's subnet access control on both the tracked-device list and the picker
-- **On the Investigation page** (Jen 5.68.0): a card under "What else Jen knows" for a tracked device — online or offline, since when, last seen, and (to an admin) which sinks it is published to
+- **On the Investigation page** (Jen 5.68.0): a card under "What else Jen knows" for a tracked device — online or offline, since when, last seen, and (to an admin) which sinks it is published to. A tracked device is judged by the subnet it was tracked in, so it is not shown to an account that cannot see that subnet just because the device has since moved into one it can; where the device is now is shown only when the account may see that subnet too
 - **Send test** on any sink, to confirm credentials and connectivity without waiting for a real transition (one non-retained message on `<prefix>/test`, or an HTTP body marked `"test": true`; nothing durable)
 - Credentials (an MQTT password, or an HTTP bearer token) are stored encrypted and never shown again once saved
 

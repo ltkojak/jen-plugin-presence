@@ -943,19 +943,69 @@ def main():
     check(p._investigate(subject, [1], False) is None, "_investigate: a client that is not tracked gets None")
     p._get_db = lambda: FakeDB([dict(tracked_on)])
     check(p._investigate(subject, [2], False) is None, "_investigate: a client outside the caller's set is None")
-    p._current_subnet_for_mac = lambda mac: 2  # moved since it was tracked with subnet 1
-    p._get_db = lambda: FakeDB([dict(tracked_on)])
+    # ── 1.1.1: a STORED tracked row is judged by its OWN subnet; where the client is now is only shown ──
+    names = {1: {"name": "Servers", "cidr": "10.0.1.0/24"}, 2: {"name": "Lab", "cidr": "10.0.2.0/24"}}
+    p._subnet_map = lambda: names
+    check(
+        p.subnet_label(1, names) == "Servers (10.0.1.0/24)"
+        and p.subnet_label(9, names) == ""
+        and p.subnet_label(3, {3: {"name": "", "cidr": "10.0.3.0/24"}}) == "10.0.3.0/24",
+        "subnet_label: name and CIDR, the CIDR alone when unnamed, nothing for an unknown subnet",
+    )
+    check(
+        p.now_in(2, 1, names, [1, 2], False) == "Lab (10.0.2.0/24)"
+        and p.now_in(2, 1, names, [], True) == "Lab (10.0.2.0/24)",
+        "now_in: the subnet the client is in now, when the caller may see it and it differs from the stored one",
+    )
+    check(
+        p.now_in(2, 1, names, [1], False) == ""
+        and p.now_in(1, 1, names, [1], False) == ""
+        and p.now_in(None, 1, names, [1], False) == "",
+        "now_in: nothing for a subnet the caller cannot see (naming it is access), an unchanged one, or an unknown one",
+    )
+    # the leak direction: tracked in B, the client has since moved to A - a caller scoped to A must NOT see what was stored in B
+    p._current_subnet_for_mac = lambda mac: 1
+    p._get_db = lambda: FakeDB([dict(tracked_on, subnet_id=2)])
     check(
         p._investigate(subject, [1], False) is None,
-        "_investigate: judged on where the MAC is NOW, not the stale stored subnet",
+        "_investigate: a device tracked in B is not shown to a caller scoped to A because the client is now in A",
     )
-    p._current_subnet_for_mac = lambda mac: None
+    p._get_db = lambda: FakeDB([dict(tracked_on, subnet_id=2)])
+    check(
+        p._investigate(subject, [1, 2], False) is not None and p._investigate(subject, [], True) is not None,
+        "_investigate: the same row is shown to a caller who may see B, and to an unrestricted one",
+    )
+    # the other direction: tracked in A, the client is now in B - A's caller sees the row, but is not told B
+    p._current_subnet_for_mac = lambda mac: 2
     p._get_db = lambda: FakeDB([dict(tracked_on)])
-    check(p._investigate(subject, [1], False) is not None, "_investigate: the stored subnet is the fallback")
+    moved = p._investigate(subject, [1], False)
+    check(
+        moved is not None and all(r["label"] != "Now in" for r in moved["rows"]) and "Lab" not in str(moved),
+        "_investigate: tracked in A and now in B, a caller scoped to A sees the row and no word of B",
+    )
+    p._get_db = lambda: FakeDB([dict(tracked_on)])
+    both = p._investigate(subject, [1, 2], False)
+    check(
+        both is not None and {"label": "Now in", "value": "Lab (10.0.2.0/24)"} in both["rows"],
+        "_investigate: a caller who may see both is told where the client is now",
+    )
+    p._current_subnet_for_mac = lambda mac: None  # no lease or reservation: nothing to add, the row still shows
+    p._get_db = lambda: FakeDB([dict(tracked_on)])
+    nothing_now = p._investigate(subject, [1], False)
+    check(
+        nothing_now is not None and all(r["label"] != "Now in" for r in nothing_now["rows"]),
+        "_investigate: a client with no current subnet still shows its row, with no Now in row",
+    )
+    p._current_subnet_for_mac = lambda mac: 1
+    p._get_db = lambda: FakeDB([dict(tracked_on)])
+    check(
+        all(r["label"] != "Now in" for r in p._investigate(subject, [1], False)["rows"]),
+        "_investigate: a client still in the subnet it was tracked in has no Now in row",
+    )
     p._get_db = lambda: FakeDB([dict(tracked_on, subnet_id=None)])
     check(
         p._investigate(subject, [1], False) is None and p._investigate(subject, [], True) is not None,
-        "_investigate: a client with no subnet at all is for an unrestricted caller only",
+        "_investigate: a tracked row with no stored subnet is for an unrestricted caller only - even when the client is now in one",
     )
     check(
         p._investigate(types.SimpleNamespace(mac=""), [1], True) is None

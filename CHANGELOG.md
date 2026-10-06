@@ -1,5 +1,18 @@
 # Presence Plugin — Changelog
 
+## [1.1.1] - 2026-10-06
+
+Fix to the investigation provider added in 1.1.0. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: a tracked device is judged by the subnet it was tracked in, not by where the client is now
+
+1.1.0 judged the Investigation card by the subnet the MAC is in now, falling back to the tracked row's own. A tracked
+device is stored data, and the question for stored data is where it was stored: a device tracked in subnet B (its label,
+its state, and, to an admin, the sinks it is published to) was shown to a caller scoped to subnet A as soon as the
+client's lease moved to A. A tracked row is now judged by its own stored subnet, and a row with no subnet is for an
+unrestricted caller only. Where the client is now is shown on the card as **Now in** when the caller may see that subnet —
+only ever as a fact, and never named when it is a subnet the caller cannot see.
+
 ## [1.1.0] - 2026-10-04
 
 Requires Jen 5.68.0 (a 5.68.0 beta satisfies it): this release registers an **investigation provider**.

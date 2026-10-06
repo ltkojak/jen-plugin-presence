@@ -1126,7 +1126,29 @@ def _when(value):
     return str(value) if value else ""
 
 
-def investigation_card(tracked, sink_names=None):
+def subnet_label(subnet_id, subnet_map):
+    """Pure: a subnet's name for a person ("Servers (10.0.1.0/24)"), its CIDR alone when it has no name, "" when Jen does not
+    know it."""
+    info = (subnet_map or {}).get(subnet_id)
+    if not info:
+        return ""
+    name, cidr = info.get("name") or "", info.get("cidr") or ""
+    return f"{name} ({cidr})" if name and cidr else name or cidr
+
+
+def now_in(current_subnet_id, stored_subnet_id, subnet_map, accessible_subnet_ids, all_subnets):
+    """Pure: where the client is NOW, as a fact to show beside a tracked row saved in `stored_subnet_id` - "" when there is
+    nothing to add (it is still there, Jen does not know, or the caller may not see that subnet: naming a subnet is access to
+    it, so a hidden one is simply not said). It is only ever shown; what the caller may see of the tracked row was decided on
+    the stored subnet before this is asked."""
+    if current_subnet_id is None or current_subnet_id == stored_subnet_id:
+        return ""
+    if not in_scope(current_subnet_id, accessible_subnet_ids, all_subnets):
+        return ""
+    return subnet_label(current_subnet_id, subnet_map)
+
+
+def investigation_card(tracked, sink_names=None, now_in_label=""):
     """Pure: the Investigation page's card from this MAC's tracked row (joined with its state), or None when it is not
     tracked. `sink_names` is None when the caller may not see where presence is published (sinks are an admin's), else the
     names of the enabled sinks - names only, never an address or a credential."""
@@ -1152,6 +1174,8 @@ def investigation_card(tracked, sink_names=None):
         rows.append({"label": "Last seen", "value": _when(tracked["last_seen"])})
     if sink_names is not None:
         rows.append({"label": "Published to", "value": ", ".join(sink_names) if sink_names else "no enabled sink"})
+    if now_in_label:
+        rows.append({"label": "Now in", "value": now_in_label})
     return {"summary": summary, "status": "ok", "rows": rows}
 
 
@@ -1184,21 +1208,27 @@ def _enabled_sink_names():
 
 
 def _investigate(subject, accessible_subnet_ids, all_subnets):
-    """The Investigation page's card for the client Jen resolved. Judged on the subnet the MAC is in NOW (Jen's one
-    precedence), falling back to the subnet stored on its tracked row; a client outside the caller's scope - or in none,
-    for a restricted caller - gets nothing. Where presence is published is shown to an admin only."""
+    """The Investigation page's card for the client Jen resolved. A tracked row is a STORED object, so it is judged by its own
+    stored subnet (v1.1.1): the subnet the client is in now is shown ("Now in ...") when the caller may see it, and never
+    widens anything - a row tracked in a subnet the caller cannot see is not shown just because the client has since moved
+    into one they can. A row with no subnet is for an unrestricted caller only. Where presence is published is shown to an
+    admin only."""
     mac = _normalize_mac(getattr(subject, "mac", "") or "")
     if not mac:
         return None
     tracked = _tracked_for_mac(mac)
     if not tracked:
         return None
-    subnet_id = _current_subnet_for_mac(mac)
-    if subnet_id is None:
-        subnet_id = tracked.get("subnet_id")
-    if not in_scope(subnet_id, accessible_subnet_ids, all_subnets):
+    stored = tracked.get("subnet_id")
+    if not in_scope(stored, accessible_subnet_ids, all_subnets):
         return None
-    card = investigation_card(tracked, _enabled_sink_names() if _is_admin() else None)
+    try:
+        where_now = now_in(_current_subnet_for_mac(mac), stored, _subnet_map(), accessible_subnet_ids, all_subnets)
+    except Exception as e:
+        # only the "Now in" fact is lost: the tracked row itself was already judged on its own subnet above
+        logger.error(f"Presence: could not work out where {mac} is now: {e}")
+        where_now = ""
+    card = investigation_card(tracked, _enabled_sink_names() if _is_admin() else None, where_now)
     card["href"] = "/management/presence"
     return card
 
