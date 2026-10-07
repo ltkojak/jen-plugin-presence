@@ -15,6 +15,7 @@ Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 
 import importlib.util
 import os
+import pathlib
 import re
 import sys
 import types
@@ -91,6 +92,7 @@ def _stub_jen_plugin_api():
     plugin_api.subscribe = lambda kind, fn: SUBSCRIBED.append(kind)
     plugin_api.register_investigation_provider = lambda *a, **k: INVESTIGATION_CALLS.append((a, k))
     plugin_api.normalize_mac = _stub_normalize_mac
+    plugin_api.ACTIVE_LEASE4 = "state = 0 AND expire > NOW()"
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -562,6 +564,7 @@ def main():
     jen_api = types.ModuleType("jen.plugin_api")
     jen_api.encrypt_secret = lambda s: "enc:" + s
     jen_api.normalize_mac = _stub_normalize_mac
+    jen_api.ACTIVE_LEASE4 = "state = 0 AND expire > NOW()"
     sys.modules["jen"] = types.ModuleType("jen")
     sys.modules["jen.plugin_api"] = jen_api
     sys.modules["jen"].plugin_api = jen_api
@@ -1474,6 +1477,33 @@ def main():
             f"_apply_transition: the event for {mac} carries the owner subnet {expect} (got {emitted_t})",
         )
     p.request = None
+
+    # ── 1.2.3: every lease query asks for a CURRENT lease (Jen's ACTIVE_LEASE4, never a bare state = 0) ──
+    q = load_plugin()
+    _stub_jen_plugin_api()
+    src = pathlib.Path(ROOT, "plugin.py").read_text(encoding="utf-8")
+    check(
+        "state=0" not in src and "state = 0" not in src,
+        "the plugin never spells the current-lease predicate itself",
+    )
+    current = "state = 0 AND expire > NOW()"
+    kdb = FakeDB([{"ip": "10.0.0.8", "hostname": "tv"}])
+    q._get_kea_db = lambda: kdb
+    check(
+        q._current_ip_hostname("aa:bb:cc:dd:ee:08") == ("10.0.0.8", "tv"),
+        "_current_ip_hostname: the row is read as before",
+    )
+    check(current in kdb.statements[0][1], "_current_ip_hostname: asks for a current lease")
+    kdb = FakeDB([[{"mac_hex": "AABBCCDDEE08", "ip": "10.0.0.8", "hostname": "tv"}]])
+    q._get_kea_db = lambda: kdb
+    q._current_ip_hostname_bulk(["aa:bb:cc:dd:ee:08"])
+    check(current in kdb.statements[0][1], "_current_ip_hostname_bulk: asks for a current lease")
+    kdb = FakeDB([{"n": 1}])
+    q._get_kea_db = lambda: kdb
+    check(
+        q._has_active_lease("aa:bb:cc:dd:ee:08") is True and current in kdb.statements[0][1],
+        "_has_active_lease: asks for a current lease",
+    )
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")

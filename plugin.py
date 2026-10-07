@@ -423,6 +423,13 @@ def _get_kea_db():
     return get_kea_db()
 
 
+def _active_lease4():
+    """Jen's one definition of a CURRENT lease (state 0 AND not past its expiry) - never spelled here (Jen 5.68.0, Q153)."""
+    from jen.plugin_api import ACTIVE_LEASE4
+
+    return ACTIVE_LEASE4
+
+
 def _can(subnet_id):
     """May the session user act on something in `subnet_id`? None ("no attributable
     subnet") is for unrestricted users only — plugin_api decides (v5.65.2)."""
@@ -511,8 +518,8 @@ def _current_ip_hostname(mac):
             # is only updated on the next lease event) or an arbitrary one among several could win.
             # Same rule _has_active_lease applies, plus the newest lease first.
             cur.execute(
-                "SELECT inet_ntoa(address) AS ip, hostname FROM lease4 WHERE HEX(hwaddr)=%s AND state=0 "
-                "AND expire > NOW() ORDER BY expire DESC LIMIT 1",
+                f"SELECT inet_ntoa(address) AS ip, hostname FROM lease4 WHERE HEX(hwaddr)=%s AND {_active_lease4()} "
+                "ORDER BY expire DESC LIMIT 1",  # nosec B608 - a fixed constant, every value is bound
                 (hex_mac,),
             )
             row = cur.fetchone()
@@ -544,7 +551,7 @@ def _current_ip_hostname_bulk(macs):
         with kdb.cursor() as cur:
             cur.execute(
                 f"SELECT HEX(hwaddr) AS mac_hex, inet_ntoa(address) AS ip, hostname FROM lease4 "
-                f"WHERE HEX(hwaddr) IN ({placeholders}) AND state=0 AND expire > NOW() "
+                f"WHERE HEX(hwaddr) IN ({placeholders}) AND {_active_lease4()} "
                 "ORDER BY expire DESC",  # nosec B608 - only `%s` placeholders are interpolated; every value is bound
                 tuple(hex_macs),
             )
@@ -592,7 +599,7 @@ def _candidate_hosts():
         with kdb.cursor() as cur:
             cur.execute(
                 "SELECT inet_ntoa(address) AS ip, hostname, HEX(hwaddr) AS mac_hex, subnet_id "
-                "FROM lease4 WHERE state=0 AND hwaddr IS NOT NULL"
+                f"FROM lease4 WHERE {_active_lease4()} AND hwaddr IS NOT NULL"  # nosec B608 - a fixed constant
             )
             for row in cur.fetchall():
                 hex_mac = row.get("mac_hex") or ""
@@ -931,7 +938,8 @@ def _has_active_lease(mac):
         kdb = _get_kea_db()
         with kdb.cursor() as cur:
             cur.execute(
-                "SELECT COUNT(*) AS n FROM lease4 WHERE HEX(hwaddr)=%s AND state=0 AND expire > NOW()", (hex_mac,)
+                f"SELECT COUNT(*) AS n FROM lease4 WHERE HEX(hwaddr)=%s AND {_active_lease4()}",  # nosec B608 - a fixed constant
+                (hex_mac,),
             )
             row = cur.fetchone()
             return bool(row and row["n"])

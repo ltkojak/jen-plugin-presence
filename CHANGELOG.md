@@ -1,5 +1,13 @@
 # Presence Plugin — Changelog
 
+## [1.2.3] - 2026-10-07
+
+Requires Jen 5.68.0 (a 5.68.0 beta satisfies it); the constant this release uses is exported by Jen 5.68.0-beta.18 and later.
+
+### Fixed: which leases count as current
+
+Three queries - a tracked device's current address and hostname, the neighbour pass's lease list, and the other-lease check - asked for `state=0` (two of them without any expiry test), so a lease that had already ended still gave a device an address and kept it looking local. All four lease queries in the plugin now use Jen's one definition of a current lease, `ACTIVE_LEASE4` (state 0 AND not past its expiry), exported through `jen.plugin_api` instead of each spelling it; the harness proves each asks for it and that the plugin never spells the predicate itself.
+
 ## [1.2.2] - 2026-10-07
 
 Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
