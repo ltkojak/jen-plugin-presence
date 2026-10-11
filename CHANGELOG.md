@@ -1,5 +1,23 @@
 # Presence Plugin — Changelog
 
+## [1.2.4] - 2026-10-11
+
+Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
+
+### Fixed: tracking a device the caller may not see gets one refusal, and it says nothing about the MAC
+
+Tracking a MAC that already has a tracked entry in a subnet the caller cannot see answered *That device is not on a subnet you can access*,
+and tracking a MAC the caller cannot place in any subnet they can see answered *That MAC is not on a subnet you can access*. Neither
+sentence was true of a MAC the caller can see (the client may be sitting in the caller's own subnet and merely be tracked by someone else),
+and the two together told a scoped admin which MACs are tracked somewhere they may not look: try a MAC, and a different sentence meant that a
+hidden entry exists. Both refusals are now the same text, *That tracked entry is not yours to change.*, for a hidden entry and for a
+MAC with none, from the one function that judges a save (`_save_tracked`), so the Track form, the row action and a lost insert race
+all say it, and none of them claims anything about where the MAC is.
+
+The harness runs the real `track` and `track_from_row` against its fake database for all four cases (hidden entry with the client visible
+to the caller, hidden entry with the client elsewhere, no entry with the client in a subnet the caller cannot see, no entry and no known
+subnet) and requires the same sentence, nothing written and nothing audited each time.
+
 ## [1.2.3] - 2026-10-07
 
 Requires Jen 5.68.0 (a 5.68.0 beta satisfies it); the constant this release uses is exported by Jen 5.68.0-beta.18 and later.

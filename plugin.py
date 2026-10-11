@@ -1351,6 +1351,10 @@ def index():
 
 
 LOOKUP_REFUSAL = "Could not check the existing record — nothing was changed."
+# v1.2.4 - ONE refusal for "a tracked row the caller may not see" and "a MAC that is in no subnet the caller may see": 1.2.3 had two
+# sentences, and neither was true of a MAC the caller CAN see that merely has a hidden tracked row ("not on a subnet you can access"),
+# so the pair was a way to learn which MACs are tracked in a subnet one is not allowed to see. It says nothing about the MAC.
+NOT_YOURS = "That tracked entry is not yours to change."
 CHANGED_UNDERFOOT = "That device changed while you were saving it — nothing was changed. Try again."
 
 
@@ -1396,7 +1400,7 @@ def _save_tracked(db, cur, mac, label, added_by):
         if existing is not None:
             owner = existing["subnet_id"]
             if not _can(owner):
-                return "refused", "That device is not on a subnet you can access."
+                return "refused", NOT_YOURS
             cur.execute("UPDATE pr_tracked SET label=%s WHERE mac=%s AND subnet_id <=> %s", (label, mac, owner))
             if cur.rowcount == 1:
                 return "ok", ""
@@ -1408,7 +1412,7 @@ def _save_tracked(db, cur, mac, label, added_by):
             return "refused", CHANGED_UNDERFOOT
         subnet_id = _current_subnet_for_mac(mac)
         if not _can(subnet_id):
-            return "refused", "That MAC is not on a subnet you can access."
+            return "refused", NOT_YOURS
         try:
             cur.execute(
                 "INSERT INTO pr_tracked (mac, label, subnet_id, added_by) VALUES (%s, %s, %s, %s)",

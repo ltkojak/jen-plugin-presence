@@ -1431,9 +1431,7 @@ def main():
     p.request = types.SimpleNamespace(form={"mac": mac1, "label": "hijack"}, args={})
     p.track()
     check(
-        mutations(lost) == ["INSERT"]
-        and flashed == ["That device is not on a subnet you can access."]
-        and audits_h == [],
+        mutations(lost) == ["INSERT"] and flashed == [p.NOT_YOURS] and audits_h == [],
         f"track: lost the INSERT race to a B-owned row - judged again, refused, never UPDATEd (got {mutations(lost)}, {flashed})",
     )
     lost_a = FakeDB([], hook=lose(1))
@@ -1451,11 +1449,48 @@ def main():
     flashed.clear()
     p.track()
     check(
-        mutations(dead) == ["INSERT"]
-        and dead.rolled_back >= 1
-        and flashed == ["That device is not on a subnet you can access."],
+        mutations(dead) == ["INSERT"] and dead.rolled_back >= 1 and flashed == [p.NOT_YOURS],
         f"track: a deadlocked INSERT is rolled back and the winner (B's) re-judged and refused (got {mutations(dead)}, {flashed})",
     )
+
+    # ── 1.2.4: ONE refusal text for "a tracked row the caller may not see" and "a MAC in no subnet the caller may see", and it says
+    #    nothing about the MAC. The same sentence for hidden and nonexistent: neither route tells which one it was. ──
+    check(
+        p.NOT_YOURS == "That tracked entry is not yours to change." and "MAC" not in p.NOT_YOURS,
+        "NOT_YOURS: exactly the tracked-entry sentence, no claim about the MAC",
+    )
+    refusals = {}
+    for label, now, row in (
+        ("hidden row, client visible in A", 1, {"mac": mac1, "subnet_id": 2}),
+        ("hidden row, client in B too", 2, {"mac": mac1, "subnet_id": 2}),
+        ("no row, client in B", 2, None),
+        ("no row, client nowhere", None, None),
+    ):
+        p._current_subnet_for_mac = lambda mac, now=now: now
+        db = FakeDB([row] if row else [])
+        p._get_db = lambda db=db: db
+        flashed.clear()
+        audits_h.clear()
+        p.request = types.SimpleNamespace(form={"mac": mac1, "label": "x"}, args={})
+        p.track()
+        refusals[label] = list(flashed)
+        check(
+            flashed == [p.NOT_YOURS] and mutations(db) == [] and audits_h == [],
+            f"track: {label} - refused with the one sentence, nothing written, nothing audited (got {flashed})",
+        )
+    check(
+        len({tuple(v) for v in refusals.values()}) == 1,
+        f"track: hidden and nonexistent entries are refused with the very same text (got {refusals})",
+    )
+    # the row action goes through the same function
+    p._current_subnet_for_mac = lambda mac: 2
+    db = FakeDB([])
+    p._get_db = lambda db=db: db
+    flashed.clear()
+    p.request = types.SimpleNamespace(form={}, args={"mac": mac1, "hostname": "x"})
+    p.track_from_row()
+    check(p.NOT_YOURS in flashed and mutations(db) == [], f"track_from_row: the same refusal (got {flashed})")
+    p._current_subnet_for_mac = lambda mac: 1
 
     # ── 1.2.2: the transition event carries the OWNER subnet (it carried none, so the owner-scoped user never saw it) ──
     emitted_t = []
