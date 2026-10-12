@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from '_investigate.html' import investigate_link %}
 {% block title %}Presence{% endblock %}
 {% block content %}
 
@@ -53,6 +54,7 @@
         </td>
         <td class="small muted" data-m="hide">{{ r.since | utcfmt if r.since else '—' }}</td>
         <td data-m="trailing">
+            {{ investigate_link(r.mac, "icon") }}
             {% if is_admin %}
             {% if move_choices %}
             <form method="POST" action="{{ url_for('presence.move_subnet', mac=r.mac) }}" class="contents"

@@ -124,9 +124,13 @@ from datetime import datetime, timezone
 from flask import Blueprint, flash, redirect, render_template, request, url_for
 from flask_login import current_user, login_required
 
+from jen.plugin_api import is_admin_or_above, is_superadmin, require_write
+
 logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "presence"
+
+_VIEWER_MESSAGE = "Viewers can look at Presence but not change it."
 
 bp = Blueprint(
     "presence",
@@ -444,38 +448,10 @@ def _subnet_map():
     return subnet_map()
 
 
-def _is_admin():
-    try:
-        from jen.plugin_api import is_admin_or_above
-
-        return is_admin_or_above()
-    except Exception:
-        role = getattr(current_user, "role", None)
-        if role is not None:
-            return role in ("superadmin", "admin")
-        return bool(getattr(current_user, "is_admin", False))
-
-
-def _require_write():
-    if _is_admin():
-        return True
-    flash("Viewers can look at Presence but not change it.", "error")
-    return False
-
-
-def _is_superadmin():
-    try:
-        from jen.plugin_api import is_superadmin
-
-        return is_superadmin()
-    except Exception:
-        return getattr(current_user, "role", None) == "superadmin"
-
-
 def _require_superadmin():
     """Sinks are global integrations with a credential that receive every tracked
     client's state, so configuring one is a superadmin action (like Alerts channels)."""
-    if _is_superadmin():
+    if is_superadmin():
         return True
     flash("Sinks are global integration settings: only a superadmin can change them.", "error")
     return False
@@ -1233,7 +1209,7 @@ def _investigate(subject, accessible_subnet_ids, all_subnets):
         # only the "Now in" fact is lost: the tracked row itself was already judged on its own subnet above
         logger.error(f"Presence: could not work out where {mac} is now: {e}")
         where_now = ""
-    card = investigation_card(tracked, _enabled_sink_names() if _is_admin() else None, where_now)
+    card = investigation_card(tracked, _enabled_sink_names() if is_admin_or_above() else None, where_now)
     card["href"] = "/management/presence"
     return card
 
@@ -1336,17 +1312,17 @@ def index():
             for sid, info in subnet_map.items()
             if _can(sid)
         ]
-        if _is_admin()
+        if is_admin_or_above()
         else []
     )
     return render_template(
         "presence/index.html",
         rows=rows,
         move_choices=move_choices,
-        sinks=_sink_rows() if _is_admin() else [],
-        candidates=_candidate_hosts() if _is_admin() else [],
-        is_admin=_is_admin(),
-        is_superadmin=_is_superadmin(),
+        sinks=_sink_rows() if is_admin_or_above() else [],
+        candidates=_candidate_hosts() if is_admin_or_above() else [],
+        is_admin=is_admin_or_above(),
+        is_superadmin=is_superadmin(),
     )
 
 
@@ -1455,9 +1431,8 @@ def _track(mac, label, source):
 
 @bp.route("/track", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "presence.index")
 def track():
-    if not _require_write():
-        return redirect(url_for("presence.index"))
     mac = _normalize_mac(request.form.get("mac", ""))
     if not mac:
         flash("Invalid MAC address.", "error")
@@ -1478,11 +1453,10 @@ def track():
 
 @bp.route("/move/<mac>", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "presence.index")
 def move_subnet(mac):
     """Re-file a tracked device under another subnet - the ONLY way its owner subnet changes after it is tracked (v1.2.0). The
     caller must be able to see both the subnet it is in and the one it is going to; the move is audited with both."""
-    if not _require_write():
-        return redirect(url_for("presence.index"))
     mac = _normalize_mac(mac)
     if not mac:
         flash("Device not found.", "error")
@@ -1532,9 +1506,8 @@ def move_subnet(mac):
 
 @bp.route("/untrack/<mac>", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "presence.index")
 def untrack(mac):
-    if not _require_write():
-        return redirect(url_for("presence.index"))
     mac = _normalize_mac(mac)
     if not mac:
         flash("Device not found.", "error")
@@ -1576,9 +1549,8 @@ def untrack(mac):
 
 @bp.route("/track-row", methods=["POST"])
 @login_required
+@require_write(_VIEWER_MESSAGE, "presence.index")
 def track_from_row():
-    if not _require_write():
-        return redirect(url_for("presence.index"))
     mac = _normalize_mac(request.args.get("mac", ""))
     if not mac:
         flash("Invalid MAC address.", "error")

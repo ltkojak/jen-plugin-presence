@@ -13,6 +13,7 @@ call of register(app) against a stub jen.plugin_api (the Q89 lesson).
 Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 """
 
+import functools
 import importlib.util
 import os
 import pathlib
@@ -56,6 +57,50 @@ class _FakeApp:
         pass
 
 
+# The role gate the real jen.plugin_api provides (`is_admin_or_above`, `is_superadmin`, `require_write`), reading the
+# stub current_user's role LIVE so a check can flip it. plugin.py imports them at the top, so they must exist before it
+# is loaded. A refusal is recorded (message, endpoint) and the route is not run, which is what the real decorator does
+# for a page request: flash, redirect, never touch the request.
+GATE_REFUSALS = []
+
+
+def _gate_is_admin_or_above():
+    return getattr(sys.modules["flask_login"].current_user, "role", None) in ("superadmin", "admin")
+
+
+def _gate_is_superadmin():
+    return getattr(sys.modules["flask_login"].current_user, "role", None) == "superadmin"
+
+
+def _gate_require_write(message="Viewers can look at this but not change it.", redirect_endpoint="dashboard.dashboard"):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapped(*a, **k):
+            if _gate_is_admin_or_above():
+                return fn(*a, **k)
+            GATE_REFUSALS.append((message, redirect_endpoint))
+            return "refused"
+
+        return wrapped
+
+    return deco
+
+
+def _install_gate_api(plugin_api=None):
+    """Put the gate functions on the stub jen.plugin_api (creating the stub package when none exists yet)."""
+    if plugin_api is None:
+        plugin_api = sys.modules.get("jen.plugin_api")
+        if plugin_api is None:
+            jen_pkg = types.ModuleType("jen")
+            plugin_api = types.ModuleType("jen.plugin_api")
+            jen_pkg.plugin_api = plugin_api
+            sys.modules["jen"] = jen_pkg
+            sys.modules["jen.plugin_api"] = plugin_api
+    plugin_api.is_admin_or_above = _gate_is_admin_or_above
+    plugin_api.is_superadmin = _gate_is_superadmin
+    plugin_api.require_write = _gate_require_write
+
+
 def _stub_normalize_mac(raw):
     """Same contract as jen/services/plugin_helpers.py::normalize_mac — a MAC as lowercase
     colon-separated, or None for anything that isn't twelve hex digits once separators are
@@ -93,6 +138,7 @@ def _stub_jen_plugin_api():
     plugin_api.register_investigation_provider = lambda *a, **k: INVESTIGATION_CALLS.append((a, k))
     plugin_api.normalize_mac = _stub_normalize_mac
     plugin_api.ACTIVE_LEASE4 = "state = 0 AND expire > NOW()"
+    _install_gate_api(plugin_api)
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -101,6 +147,7 @@ def _stub_jen_plugin_api():
 
 def load_plugin():
     _stub_modules()
+    _install_gate_api()
     spec = importlib.util.spec_from_file_location("presence_plugin", os.path.join(ROOT, "plugin.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -358,13 +405,25 @@ def main():
 
     # ── write gate — viewers can look at Presence but not change it ─────────
     p.current_user.role = "viewer"
-    check(p._is_admin() is False, "a viewer is not admin")
-    check(p._require_write() is False, "a viewer cannot write")
+    check(p.is_admin_or_above() is False, "a viewer is not admin")
     for fn, args in (
         (p.track, ()),
         (p.untrack, ("aa:bb:cc:dd:ee:ff",)),
         (p.move_subnet, ("aa:bb:cc:dd:ee:ff",)),
         (p.track_from_row, ()),
+    ):
+        del GATE_REFUSALS[:]
+        try:
+            got = fn(*args)
+            gated = got == "refused"
+        except Exception:
+            gated = False
+        check(gated, f"{fn.__name__} refuses a viewer before touching the request")
+        check(
+            GATE_REFUSALS == [("Viewers can look at Presence but not change it.", "presence.index")],
+            f"{fn.__name__}: the viewer is told the plugin's own sentence and sent to the Presence page (got {GATE_REFUSALS})",
+        )
+    for fn, args in (
         (p.add_sink, ()),
         (p.toggle_sink, (1,)),
         (p.delete_sink, (1,)),
@@ -377,7 +436,16 @@ def main():
             gated = False
         check(gated, f"{fn.__name__} refuses a viewer before touching the request")
     p.current_user.role = "admin"
-    check(p._is_admin() is True, "admin role restored for the rest of the run")
+    check(p.is_admin_or_above() is True, "admin role restored for the rest of the run")
+    check(
+        all(fn.__name__ == fn.__wrapped__.__name__ for fn in (p.track, p.untrack, p.move_subnet, p.track_from_row)),
+        "the four write routes carry the plugin_api require_write decorator (functools.wraps)",
+    )
+    src = pathlib.Path(ROOT, "plugin.py").read_text(encoding="utf-8")
+    check(
+        "def _is_admin" not in src and "def _require_write" not in src and "def _is_superadmin" not in src,
+        "plugin.py no longer carries its own copies of the admin check, the superadmin check or the write gate",
+    )
 
     # ── 1.0.1: parse_mqtt_url — a bad port is a refusal, not a 500 ───────────
     for bad in ("mqtt://host:abc", "mqtt://host:99999", "mqtt://host:0", "mqtts://host:-1"):
@@ -514,7 +582,6 @@ def main():
     p.flash = lambda msg, cat="message": flashed.append(msg)
     p.redirect = lambda where: "redirect"
     p.url_for = lambda *a, **k: "/x"
-    p._require_write = lambda: True
     mac_subnet = {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}
     p._current_subnet_for_mac = lambda mac: mac_subnet.get(mac)
 
@@ -529,7 +596,7 @@ def main():
             f"{fn.__name__}: an admin who is not a superadmin is refused before any database access",
         )
     p.current_user.role = "superadmin"
-    check(p._is_superadmin() is True, "a superadmin passes the sink gate")
+    check(p.is_superadmin() is True, "a superadmin passes the sink gate")
     p.current_user.role = "admin"
 
     # ── 1.0.1: adding a sink validates URL, scheme and the credential pair ───
@@ -736,10 +803,10 @@ def main():
     import ipaddress as _ip
 
     names = {1: {"name": "A", "cidr": "10.1.0.0/24"}, 2: {"name": "B", "cidr": "10.2.0.0/24"}}
-    real_is_admin, real_mark = p._is_admin, p._mark_lease_based
+    real_is_admin, real_mark = p.is_admin_or_above, p._mark_lease_based
     p._subnet_map = lambda: names
     p._mark_lease_based = lambda rows: rows
-    p._is_admin = lambda: False
+    p.is_admin_or_above = lambda: False
     p.render_template = lambda name, **kw: kw
     owned_b = {
         "mac": "aa:bb:cc:dd:ee:01",
@@ -772,7 +839,7 @@ def main():
         [(r["label"], r["subnet_name"], r["now_in"]) for r in page["rows"]] == [("phone", "A", "")],
         "index: tracked in A, client now in B - an A caller keeps it, filed under A, with no word of B",
     )
-    p._is_admin = lambda: True
+    p.is_admin_or_above = lambda: True
     p._sink_rows = list
     p._candidate_hosts = list
     p._can = lambda sid: sid in (1, 2)
@@ -785,7 +852,7 @@ def main():
         [c["id"] for c in p.index()["move_choices"]] == [1],
         "index: ...and only those (a scoped admin is not offered B)",
     )
-    p._is_admin, p._mark_lease_based = real_is_admin, real_mark
+    p.is_admin_or_above, p._mark_lease_based = real_is_admin, real_mark
 
     # the explicit move: both subnets in scope, audited, and nothing else changes the owner subnet
     check(
@@ -1039,7 +1106,7 @@ def main():
     )
     subject = types.SimpleNamespace(mac="AA:BB:CC:DD:EE:01")
     p._current_subnet_for_mac = lambda mac: 1
-    p._is_admin = lambda: True
+    p.is_admin_or_above = lambda: True
     fdb = FakeDB([dict(tracked_on)])
     p._get_db = lambda: fdb
     # the second FakeDB read (the sinks) needs its own answer: one DB object serves both queries in order
@@ -1059,7 +1126,7 @@ def main():
         all("credential" not in s[1] and "url" not in s[1] for s in fdb.statements),
         "_investigate: the sinks query never reads a credential or an address",
     )
-    p._is_admin = lambda: False
+    p.is_admin_or_above = lambda: False
     p._get_db = lambda: FakeDB([dict(tracked_on)])
     check(
         all(r["label"] != "Published to" for r in p._investigate(subject, [1], False)["rows"]),
@@ -1315,7 +1382,6 @@ def main():
 
     audits_h = []
     p._audit = lambda action, target, detail: audits_h.append((action, target, detail))
-    p._require_write = lambda: True
     p._can = only_one
     p._current_subnet_for_mac = lambda mac: 1  # the client is in A; the tracking is owned by B
     p.flash = lambda msg, cat="message": flashed.append(msg)
@@ -1359,7 +1425,6 @@ def main():
     p._can = only_one  # an admin of subnet 1 (A); subnet 2 (B) is hidden from them
     p._current_subnet_for_mac = lambda mac: 1
     p._subnet_map = lambda: {1: {"name": "A", "cidr": "10.1.0.0/24"}, 2: {"name": "B", "cidr": "10.2.0.0/24"}}
-    p._require_write = lambda: True
     mac1 = "aa:bb:cc:dd:ee:01"
 
     def became_b(db, kind, sql, params):
@@ -1538,6 +1603,13 @@ def main():
     check(
         q._has_active_lease("aa:bb:cc:dd:ee:08") is True and current in kdb.statements[0][1],
         "_has_active_lease: asks for a current lease",
+    )
+
+    # ── 1.2.5: every tracked row carries the Investigate action (Jen's macro) ─────────────────────────────────────
+    page = pathlib.Path(ROOT, "templates", "presence", "index.html").read_text(encoding="utf-8")
+    check(
+        "{% from '_investigate.html' import investigate_link %}" in page and 'investigate_link(r.mac, "icon")' in page,
+        "index.html: each tracked row carries Jen's Investigate macro, given its MAC",
     )
 
     if failures:

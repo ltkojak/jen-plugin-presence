@@ -32,10 +32,15 @@ Every sink send has a 10-second timeout; a failure records `last_error` on the s
 - **Track** row action on Lease and Device rows, plus a picker (over reservations and leases) on the Presence page itself
 - Respects Jen's subnet access control on both the tracked-device list and the picker. `pr_tracked.subnet_id` is the **owner subnet** of a tracking (v1.2.0): written when the device is tracked, changed only by an admin's explicit **Move** (who must be able to see both subnets; audited), never by a lease event. Visibility, relabel, untrack and the card judge on it; where the device is now is derived when the page is read and shown (*now in …*) only to an account that may see that subnet. A device that had followed a client under an older release keeps the subnet it has: move it by hand if it should belong elsewhere
 - **On the Investigation page** (Jen 5.68.0): a card under "What else Jen knows" for a tracked device — online or offline, since when, last seen, and (to an admin) which sinks it is published to. A tracked device is judged by the subnet it was tracked in, so it is not shown to an account that cannot see that subnet just because the device has since moved into one it can; where the device is now is shown only when the account may see that subnet too
+- **Investigate** on every tracked row, Jen's own action for a row that names a client
 - **Send test** on any sink, to confirm credentials and connectivity without waiting for a real transition (one non-retained message on `<prefix>/test`, or an HTTP body marked `"test": true`; nothing durable)
 - Credentials (an MQTT password, or an HTTP bearer token) are stored encrypted and never shown again once saved
 
 Adding, removing, and tracking a device need admin — viewers are read-only. **Sinks are superadmin-only**: every transition publishes every tracked device's MAC, label, IP, hostname and state to every enabled sink, so adding, pausing, testing or removing one is a global integration change, like an Alerts channel (other admins see the list read-only). A tracked device belongs to the subnet its MAC is in (worked out server-side, never from a value in the request), and re-tracking an existing device can only change its label.
+
+## Recorded for the audit trail, not displayed
+
+`pr_tracked.added_by` (the username that first tracked the device) and `pr_tracked.added_at` are written when a device is tracked and read by nothing in this plugin, so no page, card or event shows who started tracking a device or when. They stay in the table as the record of how each device came to be tracked and are not dropped. (The *Move* of a tracked device is audited in Jen's own audit log with both subnets.)
 
 ## Installation
 

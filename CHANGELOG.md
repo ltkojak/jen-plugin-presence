@@ -1,5 +1,21 @@
 # Presence Plugin — Changelog
 
+## [1.2.5] - 2026-10-12
+
+Cleanup; no change to what is tracked, published or stored. `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged: the helpers this release imports (`require_write`, `is_admin_or_above`, `is_superadmin`) are all exported by `jen.plugin_api` in 5.68.0 (the oldest Jen this plugin runs on).
+
+### Changed: the admin check, the superadmin check and the viewer gate are Jen's, not copies
+
+Each plugin carried its own `_is_admin`, `_is_superadmin` and `_require_write`, with a fallback to reading `current_user.role` for a Jen that did not export the helper; copies of that shape had drifted between plugins. The four write routes (track, move, untrack and the Track row action) now use `jen.plugin_api.require_write` with this plugin's sentence and the Presence page as the place to land, and the page and the Investigation card ask `is_admin_or_above()` and `is_superadmin()` directly. For a form post nothing a person sees changes: the same sentence, the same redirect, decided before the route reads the request. A request that is JSON or under `/api/` would now get a 403 body instead of a flash that surfaces on the next page; none of this plugin's routes is one, so this is a guard, not a change. The sink routes keep `_require_superadmin`: Jen's own `superadmin_required` flashes a different sentence and lands on the dashboard, where this one says why only a superadmin may touch a sink and lands back here.
+
+### Added: Investigate on every tracked row
+
+A tracked row names a device, so it carries Jen's Investigate action (the shared `investigate_link` macro), given the row's MAC.
+
+### Documented, not changed
+
+`pr_tracked.added_by` and `added_at` are written when a device is tracked and read by nothing here; the README now says they are recorded for the audit trail and not displayed. `in_scope`, `_when` and `subnet_label` stay: they are pure functions of this plugin's own card, and `plugin_api` has no equivalent. `_normalize_mac` stays as a thin wrapper because this plugin treats a bad MAC as "none given" (`""`), where `plugin_api.normalize_mac` answers `None`.
+
 ## [1.2.4] - 2026-10-11
 
 Fix. No change to what Jen needs: `requires_jen` stays 5.68.0.
