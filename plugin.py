@@ -116,6 +116,7 @@ import socket
 import ssl
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -143,6 +144,12 @@ bp = Blueprint(
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 _SEEN_STATES = ("REACHABLE", "DELAY", "PROBE")
 _OFFLINE_MISS_THRESHOLD = 3
+# v1.2.6 (PR-1) - the probe of a device the first read did not show (see `_confirmed_by_probe`). The wait is what the kernel needs to
+# answer with its defaults: a STALE entry is DELAY for 5 s (delay_first_probe_time), then asked up to 3 times a second apart
+# (ucast_solicit, retrans_time_ms), so it is REACHABLE after about 6 s when the device answers and FAILED after about 8 s when it does not.
+_PROBE_PORT = 9  # discard: nothing is expected to listen, and nothing needs to
+_PROBE_WAIT_S = 9
+_PROBE_MAX = 64
 # 5, not the design's literal "every 2 min" — jen.services.background's
 # PERIODIC_MIN_MINUTES has enforced a 5-minute floor since Jen v5.30.0,
 # well before this plugin was written; register_periodic() raises below
@@ -313,6 +320,20 @@ def parse_neighbor_table(text):
         state = parts[-1].upper()
         seen = state in _SEEN_STATES
         out[mac] = out.get(mac, False) or seen
+    return out
+
+
+def confirmed_macs(text):
+    """Pure: `ip -4 neigh show` output -> the set of MACs whose entry is REACHABLE, and only that: the kernel heard from the device.
+    Read after a probe, where DELAY and PROBE mean "asked, no answer yet" and must not count."""
+    out = set()
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if not parts or "lladdr" not in parts or parts[-1].upper() != "REACHABLE":
+            continue
+        i = parts.index("lladdr")
+        if i + 1 < len(parts) and _MAC_RE.match(parts[i + 1].lower()):
+            out.add(parts[i + 1].lower())
     return out
 
 
@@ -1012,6 +1033,50 @@ def _local_macs(tracked, local_nets):
     return out
 
 
+def _send_probes(addresses):
+    """One empty UDP datagram to the discard port of each address; returns how many were sent. Nothing is read back and nothing needs to
+    listen there: sending makes the kernel resolve the address, which is what asks the device whether it is still there. Needs no
+    privilege and no extra program."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        logger.warning(f"Presence: could not open a socket to probe with: {type(e).__name__}")
+        return 0
+    sent = 0
+    try:
+        sock.setblocking(False)
+        for ip in addresses:
+            try:
+                sock.sendto(b"", (ip, _PROBE_PORT))
+                sent += 1
+            except OSError:
+                continue
+    finally:
+        sock.close()
+    return sent
+
+
+def _confirmed_by_probe(ip_bin, macs):
+    """v1.2.6 (PR-1) - the subset of `macs` that answer when asked. The first read of the neighbor table shows a device only when the Jen
+    host itself exchanged traffic with it in the last half minute or so; a phone at home that Jen never talks to is STALE or absent, so
+    it missed every pass, was published offline after three, and a lease renewal (which is no event) never brought it back. Each such
+    device that holds a lease is sent one datagram, the kernel asks it by ARP, and after `_PROBE_WAIT_S` the table is read again: only a
+    REACHABLE entry with the device's own MAC counts. A device with no current lease has no address to ask and is a miss as before; when
+    nothing could be sent or the table cannot be read the answer is the empty set, which is also what it was before."""
+    addresses = sorted({ip for ip, _hostname in _current_ip_hostname_bulk(macs).values() if ip})[:_PROBE_MAX]
+    if not addresses or not _send_probes(addresses):
+        return set()
+    time.sleep(_PROBE_WAIT_S)
+    try:
+        result = subprocess.run([ip_bin, "-4", "neigh", "show"], capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        logger.warning(f"Presence: could not read the neighbour table after the probe: {e}")
+        return set()
+    if result.returncode != 0:
+        return set()
+    return confirmed_macs(result.stdout) & set(macs)
+
+
 def _neighbor_tick():
     tracked = _tracked_macs()
     if not tracked:
@@ -1036,6 +1101,10 @@ def _neighbor_tick():
         logger.warning(f"Presence: could not read the neighbour table: {e}")
         return
     seen_by_mac = parse_neighbor_table(result.stdout if result.returncode == 0 else "")
+    unseen = [mac for mac in tracked if not seen_by_mac.get(mac)]
+    if unseen:
+        for mac in _confirmed_by_probe(ip_bin, unseen):
+            seen_by_mac[mac] = True
 
     db = None
     try:

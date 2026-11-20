@@ -1026,6 +1026,88 @@ def main():
         transitions == [] and fdb.statements == [],
         "_neighbor_tick: when the host's own subnets cannot be read, the pass counts nothing",
     )
+    # ── 1.2.6 (PR-1): a device the first read does not show is asked before it is a miss ─
+    stale = "10.1.0.50 dev eth0 lladdr aa:bb:cc:dd:ee:01 STALE\n"
+    reachable = "10.1.0.50 dev eth0 lladdr aa:bb:cc:dd:ee:01 REACHABLE\n"
+    check(
+        p.confirmed_macs(
+            reachable
+            + "10.1.0.51 dev eth0 lladdr aa:bb:cc:dd:ee:09 DELAY\n10.1.0.52 dev eth0 lladdr aa:bb:cc:dd:ee:08 PROBE\n"
+        )
+        == {"aa:bb:cc:dd:ee:01"},
+        "confirmed_macs: after a probe only REACHABLE counts; DELAY and PROBE are a question with no answer yet",
+    )
+    check(
+        p.confirmed_macs(stale + "10.1.0.60 dev eth0 FAILED\n") == set(),
+        "confirmed_macs: STALE and FAILED confirm nothing",
+    )
+
+    def neighbor_pass(tables, leases, misses=2, sendable=True):
+        """Run the real `_neighbor_tick` for one local device recorded online with `misses`: `tables` are the answers of `ip -4 neigh show`
+        in call order, `leases` what `_current_ip_hostname_bulk` answers. Returns (transitions, statements, probed addresses, table reads)."""
+        answers, probed, moved = list(tables), [], []
+        m = load_plugin()  # its own copy: the checks after this block need the shared one's real functions
+
+        class _Neigh:
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = answers.pop(0)
+
+        m._tracked_macs = lambda: {"aa:bb:cc:dd:ee:01"}
+        m._ip_binary = lambda: "ip"
+        m._local_networks = lambda ip_bin: nets
+        m._local_macs = lambda tracked, local_nets: set(tracked)
+        m._current_ip_hostname_bulk = lambda macs: dict(leases)
+        m._send_probes = lambda addresses: (probed.extend(addresses), len(addresses) if sendable else 0)[1]
+        m._PROBE_WAIT_S = 0
+        m.subprocess = types.SimpleNamespace(run=lambda *a, **k: _Neigh(), TimeoutExpired=Exception)
+        db = FakeDB([[{"mac": "aa:bb:cc:dd:ee:01", "online": 1, "misses": misses}]])
+        m._get_db = lambda: db
+        m._apply_transition = lambda mac, online: moved.append((mac, online))
+        m._neighbor_tick()
+        return moved, db.statements, probed, len(tables) - len(answers)
+
+    lease = {"aa:bb:cc:dd:ee:01": ("10.1.0.50", "phone")}
+    moved, statements, probed, reads = neighbor_pass([stale, reachable], lease)
+    check(
+        moved == [] and probed == ["10.1.0.50"] and reads == 2,
+        f"_neighbor_tick (PR-1): a STALE device that answers the probe is not a miss and stays online (got {moved}, {probed}, {reads} reads)",
+    )
+    check(
+        [st[2] for st in statements if st[0] == "UPDATE" and "misses" in st[1]] == [(0, "aa:bb:cc:dd:ee:01")],
+        f"_neighbor_tick (PR-1): the answered probe puts the miss count back to 0 (got {[st for st in statements if st[0] == 'UPDATE']})",
+    )
+    moved, _statements, probed, reads = neighbor_pass([stale, stale], lease)
+    check(
+        moved == [("aa:bb:cc:dd:ee:01", False)] and probed == ["10.1.0.50"] and reads == 2,
+        f"_neighbor_tick (PR-1): a device that does not answer is offline at its third miss, as before (got {moved})",
+    )
+    moved, _statements, probed, reads = neighbor_pass([stale], {})
+    check(
+        moved == [("aa:bb:cc:dd:ee:01", False)] and probed == [] and reads == 1,
+        f"_neighbor_tick (PR-1): a device with no lease has no address to ask and is a miss as before (got {moved}, {probed}, {reads} reads)",
+    )
+    moved, _statements, probed, reads = neighbor_pass([stale], lease, sendable=False)
+    check(
+        moved == [("aa:bb:cc:dd:ee:01", False)] and reads == 1,
+        f"_neighbor_tick (PR-1): when nothing could be sent the table is not read again and the miss counts (got {moved}, {reads} reads)",
+    )
+    moved, _statements, probed, reads = neighbor_pass([reachable], lease)
+    check(
+        moved == [] and probed == [] and reads == 1,
+        "_neighbor_tick (PR-1): a device the first read shows is not asked",
+    )
+    probe_module = load_plugin()
+    check(
+        probe_module._send_probes(["127.0.0.1", "not an address"]) == 1,
+        "_send_probes: the real function sends one datagram to an address and passes over one that is not",
+    )
+    check(
+        (probe_module._PROBE_PORT, probe_module._PROBE_WAIT_S, probe_module._PROBE_MAX) == (9, 9, 64),
+        "the probe goes to the discard port, waits nine seconds and asks at most 64 devices a pass",
+    )
+
     rows = [{"mac": "aa:bb:cc:dd:ee:01"}, {"mac": "aa:bb:cc:dd:ee:02"}]
     p._local_networks = lambda ip_bin: nets
     marked = p._mark_lease_based([dict(r) for r in rows])

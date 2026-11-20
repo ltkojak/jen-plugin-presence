@@ -1,5 +1,23 @@
 # Presence Plugin — Changelog
 
+## [1.2.6] - 2026-11-20
+
+One fix, from the plugin audit for Jen 7.2.0 (PR-1). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.
+
+### Fixed: a device on the Jen host's own network was called offline while it was at home (PR-1)
+
+For a tracked device on a network the Jen host has an interface on, the pass every five minutes reads the host's neighbor table and counts the device as seen when its entry is `REACHABLE`, `DELAY` or `PROBE`. Linux keeps an entry in those states only for some tens of seconds after the host itself exchanged traffic with the device. A phone that Jen never talks to is `STALE` or not in the table at all, so it missed every pass: fifteen minutes after it joined it was published offline, and it stayed offline while it was at home, because a lease renewal is not an event and nothing else brought it back. Version 1.0.1 fixed this for devices behind a router; this is the same defect for the local network.
+
+The pass now asks. A tracked device the table does not show as seen, and that holds a lease, is sent one empty UDP datagram to its address (port 9, discard). Nothing is read back and nothing needs to listen: sending makes the kernel resolve the address, which asks the device by ARP. Nine seconds later the table is read again, and a device whose entry is then `REACHABLE` counts as seen. The three-misses rule is unchanged, so a device that is gone is still published offline after three passes, and one that sleeps through one question is not.
+
+Measured on Ubuntu 24.04 (kernel defaults) before this release: a `STALE` entry of a host that is there is `REACHABLE` six seconds after the datagram; an address nothing answers on is `FAILED` within eight.
+
+What this changes on the wire: at most 64 datagrams per pass, each to the leased address of a device you chose to track, only on a network the Jen host is on, and only for a device the first read did not show. The pass takes nine seconds longer when it asks. A device with no current lease is not asked.
+
+### The harness
+
+`tools/test_plugin.py` runs the pass with a table that shows the device `STALE` first and `REACHABLE` after the probe (no miss, no transition), with one that never confirms it (offline at the third miss, as before), with a device that has no lease (not asked), and with a probe that cannot be sent; it checks that `DELAY` and `PROBE` after a probe do not count; and it sends one real datagram to the loopback address through the real `_send_probes`.
+
 ## [1.2.5] - 2026-10-12
 
 Cleanup; no change to what is tracked, published or stored. `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged: the helpers this release imports (`require_write`, `is_admin_or_above`, `is_superadmin`) are all exported by `jen.plugin_api` in 5.68.0 (the oldest Jen this plugin runs on).
