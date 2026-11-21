@@ -15,8 +15,10 @@ Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 
 import functools
 import importlib.util
+import math
 import os
 import pathlib
+import random
 import re
 import sys
 import types
@@ -401,6 +403,19 @@ def main():
     check(
         p._current_ip_hostname_bulk(["aa:bb:cc:dd:ee:01"]) == {},
         "_current_ip_hostname_bulk: an unreadable lease table degrades to an empty map, never raises",
+    )
+    try:
+        p._current_ip_hostname_bulk(["aa:bb:cc:dd:ee:01"], strict=True)
+        strict_raised = False
+    except p._LeaseLookupFailed:
+        strict_raised = True
+    check(
+        strict_raised,
+        "_current_ip_hostname_bulk (BG2): asked strictly, an unreadable lease table raises _LeaseLookupFailed, not an empty map",
+    )
+    check(
+        p._current_ip_hostname_bulk([], strict=True) == {},
+        "_current_ip_hostname_bulk (BG2): asked strictly about no MACs, the answer is still an empty map and no query",
     )
 
     # ── write gate — viewers can look at Presence but not change it ─────────
@@ -997,7 +1012,7 @@ def main():
     p._local_networks = lambda ip_bin: nets
     p._tracked_subnets = lambda: {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2}
     p._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
-    p._current_ip_hostname_bulk = lambda macs: {}
+    p._current_ip_hostname_bulk = lambda macs, strict=False: {}
 
     class _Result:
         returncode = 0
@@ -1058,7 +1073,7 @@ def main():
         m._ip_binary = lambda: "ip"
         m._local_networks = lambda ip_bin: nets
         m._local_macs = lambda tracked, local_nets: set(tracked)
-        m._current_ip_hostname_bulk = lambda macs: dict(leases)
+        m._current_ip_hostname_bulk = lambda macs, strict=False: dict(leases)
         m._send_probes = lambda addresses: (probed.extend(addresses), len(addresses) if sendable else 0)[1]
         m._PROBE_WAIT_S = 0
         m.subprocess = types.SimpleNamespace(run=lambda *a, **k: _Neigh(), TimeoutExpired=Exception)
@@ -1694,20 +1709,31 @@ def main():
         "index.html: each tracked row carries Jen's Investigate macro, given its MAC",
     )
 
-    # ── 1.2.7: with more unseen devices than one pass asks, every device is asked in turn and none is missed unasked ──
+    # ── 1.2.7, 1.2.8 (BG4): with more unseen devices than one pass asks, the ones asked longest ago are asked first ──
     check(
-        p.probe_batch(["10.0.0.100", "10.0.0.11", "10.0.0.9"], 0, 64) == (["10.0.0.9", "10.0.0.11", "10.0.0.100"], 0),
-        "probe_batch: addresses are ordered as numbers, not as text, and a short list is asked whole",
+        p.probe_batch(["10.0.0.100", "10.0.0.11", "10.0.0.9", "10.0.0.11"], {}, 64)
+        == ["10.0.0.9", "10.0.0.11", "10.0.0.100"],
+        "probe_batch (BG4): nobody asked yet - distinct addresses, ordered as numbers, not as text, and a short list is asked whole",
     )
     hundred = [f"10.1.0.{n}" for n in range(1, 101)]
-    first, nxt = p.probe_batch(hundred, 0, 64)
-    second, nxt2 = p.probe_batch(hundred, nxt, 64)
+    first = p.probe_batch(hundred, {}, 64)
+    second = p.probe_batch(hundred, dict.fromkeys(first, 1), 64)
     check(
-        first == hundred[:64] and nxt == 64 and second == hundred[64:] + hundred[:28] and nxt2 == 28,
-        f"probe_batch: the batch moves on by 64 each pass and wraps (got next {nxt}, then {nxt2})",
+        first == hundred[:64] and second == hundred[64:] + hundred[:28],
+        f"probe_batch (BG4): the 36 never asked go first, then the ones asked longest ago in numeric order (got {second[:2]} .. {second[-2:]})",
     )
-    check(set(first) | set(second) == set(hundred), "probe_batch: two passes ask all 100 devices")
-    check(p.probe_batch([], 5, 64) == ([], 0), "probe_batch: nothing to ask")
+    stamps = {"10.1.0.1": 7, "10.1.0.2": 3, "10.1.0.3": 5, "10.1.0.4": 3, "10.1.0.200": 1}
+    before = dict(stamps)
+    check(
+        p.probe_batch(["10.1.0.1", "10.1.0.2", "10.1.0.3", "10.1.0.4", "10.1.0.10", "10.1.0.9"], stamps, 5)
+        == ["10.1.0.9", "10.1.0.10", "10.1.0.2", "10.1.0.4", "10.1.0.3"],
+        "probe_batch (BG4): never asked first, then the oldest stamp, ties in numeric order, the newest stamp left for a later pass",
+    )
+    check(
+        stamps == before,
+        "probe_batch (BG4): it does not change the map it was given, and an address that is not in the unseen set is not asked",
+    )
+    check(p.probe_batch([], {"10.1.0.1": 4}, 64) == [], "probe_batch: nothing to ask")
 
     many = load_plugin()
     macs = {f"aa:bb:cc:dd:{n // 256:02x}:{n % 256:02x}": f"10.1.0.{n}" for n in range(1, 101)}
@@ -1727,7 +1753,7 @@ def main():
     many._ip_binary = lambda: "ip"
     many._local_networks = lambda ip_bin: nets
     many._local_macs = lambda tracked, local_nets: set(tracked)
-    many._current_ip_hostname_bulk = lambda asked: {mac: (macs[mac], "") for mac in asked}
+    many._current_ip_hostname_bulk = lambda asked, strict=False: {mac: (macs[mac], "") for mac in asked}
     many._send_probes = lambda addresses: (asked_log.append(list(addresses)), len(addresses))[1]
     many._PROBE_WAIT_S = 0
     many.subprocess = types.SimpleNamespace(run=lambda *a, **k: _NeighMany(), TimeoutExpired=Exception)
@@ -1769,7 +1795,7 @@ def main():
     gone = "aa:bb:cc:dd:00:64"  # 10.1.0.100: past the first 64, and it has left
     answering[gone] = False
     moved_many.clear()
-    many._probe_rotation["next"] = 0
+    many._probe_rotation.update({"pass": 0, "asked": {}})
     for _pass in range(3):
         asked_now = set()
 
@@ -1792,6 +1818,247 @@ def main():
     check(
         moved_many == [(gone, False)],
         f"_neighbor_tick: a device past the first 64 that has left is still called offline, on the pass that asks it (got {moved_many})",
+    )
+
+    # ── 1.2.8 (BG2): a lease lookup that FAILED is not "no device holds a lease" ───────────────────────────────────
+    class _StateDB:
+        """pr_state kept across passes: the real pass reads its rows and its writes land in them."""
+
+        def __init__(self, tracked, misses=0):
+            self.state = {mac: {"mac": mac, "online": 1, "misses": misses} for mac in tracked}
+            self.writes = []
+            self._rows = []
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            if sql.startswith("SELECT"):
+                self._rows = [dict(self.state[mac]) for mac in params if mac in self.state]
+            elif "SET misses" in sql:
+                self.state[params[1]]["misses"] = params[0]
+                self.writes.append(("misses", params[1], params[0]))
+            else:
+                self.writes.append(("seen", params[-1]))
+
+        def fetchall(self):
+            return self._rows
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    def lease_world(devices, kea, passes, shown=(), absent=()):
+        """The real `_neighbor_tick`, `_confirmed_by_probe` and `_current_ip_hostname_bulk`, `passes` times. `devices` is {mac: address};
+        every one of them answers when it is asked, the ones in `shown` are REACHABLE on the first read already, and the ones in
+        `absent` hold no lease. `kea` is what `_get_kea_db` does: only the databases, the sender and `ip neigh` are stood in.
+        Returns (transitions, the state store, the addresses that were sent to)."""
+        w = load_plugin()
+        moved, sent, tables = [], [], []
+        store = _StateDB(devices, misses=1 if shown else 0)
+        for mac in devices:
+            if mac not in shown:
+                store.state[mac]["misses"] = 0
+
+        class _Neigh:
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = tables.pop(0)
+
+        def _first_read():
+            return "".join(
+                f"{ip} dev eth0 lladdr {mac} {'REACHABLE' if mac in shown else 'STALE'}\n"
+                for mac, ip in devices.items()
+            )
+
+        def _send(addresses):
+            sent.extend(addresses)
+            asked = set(addresses)
+            tables.append(
+                "".join(
+                    f"{ip} dev eth0 lladdr {mac} {'REACHABLE' if ip in asked else 'STALE'}\n"
+                    for mac, ip in devices.items()
+                )
+            )
+            return len(addresses)
+
+        def _offline(mac, online):
+            moved.append((mac, online))
+            store.state[mac].update(online=1 if online else 0, misses=0)
+
+        w._tracked_macs = lambda: set(devices)
+        w._ip_binary = lambda: "ip"
+        w._local_networks = lambda ip_bin: nets
+        w._local_macs = lambda tracked, local_nets: set(tracked)
+        w._get_kea_db = lambda: kea(
+            [
+                {"mac_hex": mac.replace(":", "").upper(), "ip": ip, "hostname": ""}
+                for mac, ip in devices.items()
+                if mac not in absent
+            ]
+        )
+        w._send_probes = _send
+        w._PROBE_WAIT_S = 0
+        w.subprocess = types.SimpleNamespace(run=lambda *a, **k: _Neigh(), TimeoutExpired=Exception)
+        w._get_db = lambda: store
+        w._apply_transition = _offline
+        for _pass in range(passes):
+            tables[:] = [_first_read()]
+            w._neighbor_tick()
+        return moved, store, sent
+
+    def _kea_away(rows):
+        raise RuntimeError("Kea's database is away")
+
+    ten = {f"aa:bb:cc:dd:ee:{n:02x}": f"10.1.0.{n}" for n in range(1, 11)}
+    moved, store, sent = lease_world(ten, _kea_away, 3)
+    check(
+        moved == [] and sent == [],
+        f"_neighbor_tick (BG2): with the lease lookup failing, ten unseen devices that would answer are not called offline in three passes (got {len(moved)} offline)",
+    )
+    check(
+        all(row["misses"] == 0 for row in store.state.values()) and store.writes == [],
+        f"_neighbor_tick (BG2): with the lease lookup failing no device takes a miss and nothing is written (got {store.writes[:3]})",
+    )
+    eleven = dict(ten, **{"aa:bb:cc:dd:ee:0b": "10.1.0.11"})
+    moved, store, sent = lease_world(eleven, _kea_away, 1, shown={"aa:bb:cc:dd:ee:0b"})
+    check(
+        moved == []
+        and store.state["aa:bb:cc:dd:ee:0b"]["misses"] == 0
+        and {w[1] for w in store.writes} == {"aa:bb:cc:dd:ee:0b"},
+        f"_neighbor_tick (BG2): with the lease lookup failing, a device the first read shows is still marked seen, and only it is written (got {store.writes})",
+    )
+    moved, store, sent = lease_world(ten, _KeaDB, 3, absent={"aa:bb:cc:dd:ee:0a"})
+    check(
+        moved == [("aa:bb:cc:dd:ee:0a", False)] and "10.1.0.10" not in sent and len(sent) == 27,
+        f"_neighbor_tick (BG2): when the lookup ANSWERED, a device with no lease is a miss as before and is offline at its third (got {moved}, {len(sent)} sent)",
+    )
+    moved, store, sent = lease_world(ten, _KeaDB, 1, absent={"aa:bb:cc:dd:ee:0a"})
+    check(
+        [mac for mac, row in store.state.items() if row["misses"]] == ["aa:bb:cc:dd:ee:0a"]
+        and store.state["aa:bb:cc:dd:ee:0a"]["misses"] == 1,
+        "_neighbor_tick (BG2): when the lookup answered, the device with no lease takes one miss on one pass and the nine that answer take none",
+    )
+
+    # ── 1.2.8 (BG4): the rotation is by least recently asked, whatever the other addresses do ──────────────────────
+    def rotation_world(unseen_on_pass, passes, sendable=lambda number: True):
+        """The real `_confirmed_by_probe` (the real `probe_batch`, the real stamping) over `passes` passes; `unseen_on_pass(n)` is the
+        list of unseen addresses on pass n. Nobody answers, so who is asked depends on the rotation alone. Returns (the batch of each
+        pass, the longest wait between two asks of an address that stayed unseen all that time, the module)."""
+        r = load_plugin()
+        batches = []
+
+        class _Neigh:
+            returncode = 0
+            stdout = ""
+
+        def _send(addresses):
+            batches[-1] = list(addresses)
+            return len(addresses) if sendable(len(batches)) else 0
+
+        r._current_ip_hostname_bulk = lambda macs, strict=False: {
+            mac: (mac, "") for mac in macs
+        }  # the address stands for its MAC
+        r._send_probes = _send
+        r._PROBE_WAIT_S = 0
+        r.subprocess = types.SimpleNamespace(run=lambda *a, **k: _Neigh(), TimeoutExpired=Exception)
+        since, longest = {}, 0  # address -> the pass it was last asked on, or joined the unseen set on
+        for number in range(1, passes + 1):
+            unseen = list(unseen_on_pass(number))
+            for ip in [ip for ip in since if ip not in set(unseen)]:
+                del since[ip]  # seen again: its wait is over
+            batches.append([])
+            r._confirmed_by_probe("ip", unseen)
+            asked = set(batches[-1]) if sendable(number) else set()
+            for ip in unseen:
+                since.setdefault(ip, number - 1)
+                if ip in asked:
+                    longest = max(longest, number - since[ip])
+                    since[ip] = number
+                else:
+                    longest = max(longest, number - since[ip])
+        return batches, longest, r
+
+    pool = [f"10.1.{n // 250}.{n % 250 + 1}" for n in range(300)]
+    low, high = pool[:126], pool[126:187]
+    batches, longest, _r = rotation_world(lambda number: low + high if number % 2 else low, 200)
+    asks = {ip: sum(ip in batch for batch in batches) for ip in low}
+    check(
+        longest <= 4 and all(len(batch) == 64 for batch in batches),
+        f"_confirmed_by_probe (BG4): the unseen set alternating between 187 and 126 over 200 passes - no device waits more than 4 passes for its turn (got {longest}; fewest asks {min(asks.values())})",
+    )
+    check(
+        min(asks.values()) >= 50,
+        f"_confirmed_by_probe (BG4): in that world every always-unseen device is asked at least every fourth pass (fewest asks {min(asks.values())} of 200)",
+    )
+    bound = math.ceil(300 / 64) + 1
+    worst = []
+    for seed in (1, 2, 3):
+        rng = random.Random(seed)
+
+        def _churn(number, rng=rng):
+            seen = set(rng.sample(pool, rng.randint(0, 200)))
+            return [ip for ip in pool if ip not in seen]
+
+        _batches, longest, _r = rotation_world(_churn, 400)
+        worst.append(longest)
+    check(
+        max(worst) <= bound,
+        f"_confirmed_by_probe (BG4): 300 devices with 0 to 200 of them seen on each pass, three seeds, 400 passes - a device that stays unseen waits at most {bound} passes (got {worst})",
+    )
+    batches, _longest, r = rotation_world(lambda number: pool[:100], 3, sendable=lambda number: number != 1)
+    check(
+        batches[0] == pool[:64] and batches[1] == pool[:64] and batches[2] == pool[64:100] + pool[:28],
+        "_confirmed_by_probe (BG4): a pass that could send nothing stamps nobody - the same 64 are asked on the next pass, then the other 36",
+    )
+    silent = load_plugin()
+    silent._current_ip_hostname_bulk = lambda macs, strict=False: {mac: (mac, "") for mac in macs}
+    silent._send_probes = lambda addresses: 0
+    check(
+        silent._confirmed_by_probe("ip", pool[:100]) == (set(), set())
+        and silent._probe_rotation == {"pass": 1, "asked": {}},
+        f"_confirmed_by_probe (BG4): when _send_probes answers 0 the pass is counted and no address is stamped (got {silent._probe_rotation['pass']}, {len(silent._probe_rotation['asked'])} stamped)",
+    )
+    _batches, _longest, r = rotation_world(lambda number: pool[:100], 2)
+    check(
+        r._probe_rotation["pass"] == 2
+        and {r._probe_rotation["asked"][ip] for ip in pool[:28]} == {2}
+        and {r._probe_rotation["asked"][ip] for ip in pool[28:64]} == {1}
+        and {r._probe_rotation["asked"][ip] for ip in pool[64:100]} == {2},
+        "_confirmed_by_probe (BG4): each address of a batch that was sent is stamped with the number of its pass",
+    )
+    full = load_plugin()
+    old_addresses = [f"10.{a}.{b}.{c}" for a in (8, 9) for b in range(16) for c in range(1, 129)]
+    full._probe_rotation.update({"pass": 5000, "asked": {ip: n + 1 for n, ip in enumerate(old_addresses)}})
+    full._current_ip_hostname_bulk = lambda macs, strict=False: {mac: (mac, "") for mac in macs}
+    full._send_probes = len
+    full._PROBE_WAIT_S = 0
+
+    class _NoTable:
+        returncode = 1
+        stdout = ""
+
+    full.subprocess = types.SimpleNamespace(run=lambda *a, **k: _NoTable(), TimeoutExpired=Exception)
+    full._confirmed_by_probe("ip", pool[:64])
+    kept = full._probe_rotation["asked"]
+    check(
+        (len(old_addresses), full._ASKED_KEEP, len(kept)) == (4096, 4096, 4096)
+        and all(kept.get(ip) == 5001 for ip in pool[:64])
+        and not any(ip in kept for ip in old_addresses[:64])
+        and all(ip in kept for ip in old_addresses[64:]),
+        f"_confirmed_by_probe (BG4): the map of asked addresses is kept to 4096, the 64 asked longest ago dropped for the 64 just asked (got {len(kept)})",
     )
 
     if failures:

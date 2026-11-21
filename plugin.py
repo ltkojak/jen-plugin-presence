@@ -530,12 +530,21 @@ def _current_ip_hostname(mac):
     return None, None
 
 
-def _current_ip_hostname_bulk(macs):
+class _LeaseLookupFailed(Exception):
+    """v1.2.8 (BG2) - the lease lookup did not answer (Kea's database away, or the query raised). That is not "no device holds a
+    lease": a caller that decides from the lookup asks `_current_ip_hostname_bulk(..., strict=True)` and gets this."""
+
+
+def _current_ip_hostname_bulk(macs, strict=False):
     """{mac: (ip, hostname)} for every MAC in `macs` that currently holds an active lease, in ONE
     query — `_local_macs` (behind both the neighbour pass and every page render of the tracked
     list) used to call `_current_ip_hostname` once per tracked MAC. Same rule as that function
-    (state 0, not past expiry, newest lease wins); never raises, and a MAC with no active lease is
-    simply absent from the result rather than mapped to (None, None)."""
+    (state 0, not past expiry, newest lease wins); a MAC with no active lease is simply absent
+    from the result rather than mapped to (None, None).
+
+    When the lookup itself fails it is logged, and (v1.2.8, BG2) with `strict` it raises
+    `_LeaseLookupFailed`, for the caller that decides from the answer (`_confirmed_by_probe`).
+    Without `strict` it never raises and answers `{}`, as it always did."""
     macs = [m for m in macs if m]
     if not macs:
         return {}
@@ -560,6 +569,8 @@ def _current_ip_hostname_bulk(macs):
             return out
     except Exception as e:
         logger.warning(f"Presence: bulk lease lookup failed: {e}")
+        if strict:
+            raise _LeaseLookupFailed() from e
         return {}
     finally:
         if kdb:
@@ -1056,23 +1067,28 @@ def _send_probes(addresses):
     return sent
 
 
-def probe_batch(addresses, start, limit):
-    """Pure: `(batch, next_start)` - the at most `limit` of `addresses` to ask on this pass, and where the next pass begins.
+def probe_batch(addresses, last_asked, limit):
+    """Pure: the at most `limit` of `addresses` to ask on this pass - the distinct addresses, the one asked longest ago first.
 
-    v1.2.7 - 1.2.6 sorted the addresses as TEXT and took the first 64, which is the same 64 on every pass (`10.0.0.100` sorts
-    before `10.0.0.11`): with more unseen devices than that, the ones past the cut were never asked, took a miss on every pass
-    and were published offline although they would have answered. The addresses are ordered as numbers and the batch moves on
-    by `limit` each pass, wrapping round, so every device is asked in turn."""
-    ordered = sorted(set(addresses), key=lambda ip: tuple(int(part) for part in ip.split(".")))
-    if len(ordered) <= limit:
-        return ordered, 0
-    start %= len(ordered)
-    return (ordered + ordered)[start : start + limit], (start + limit) % len(ordered)
+    `last_asked` maps an address to the number of the pass that last asked it; it is read, never changed. An address that was never
+    asked goes first, then the one asked longest ago; addresses asked on the same pass go in numeric order (`10.0.0.9` before
+    `10.0.0.11`).
+
+    v1.2.8 (BG4) - 1.2.7 kept a position in the ordered list and moved it on by `limit` each pass. The list changes length from pass
+    to pass, so the position meant a different device each time: with the unseen set alternating between 187 and 126 devices one
+    device was asked twice in 200 passes. Ordering by when each address was last asked does not depend on what the other addresses
+    do. (1.2.6 sorted the addresses as text and took the first 64, the same 64 on every pass.)"""
+
+    def order(ip):
+        return last_asked.get(ip, -1), tuple(int(part) for part in ip.split("."))
+
+    return sorted(set(addresses), key=order)[:limit]
 
 
-_probe_rotation = {
-    "next": 0
-}  # where the next pass's batch begins; in memory only, a restart begins again at the first address
+# v1.2.8 (BG4) - "pass" counts the passes that reached the batch and "asked" is {address: the pass that last asked it}. In memory
+# only: a restart starts again with nobody asked. "asked" is kept to `_ASKED_KEEP` addresses, the ones asked longest ago dropped first.
+_probe_rotation = {"pass": 0, "asked": {}}
+_ASKED_KEEP = 4096
 
 
 def _confirmed_by_probe(ip_bin, macs):
@@ -1083,11 +1099,30 @@ def _confirmed_by_probe(ip_bin, macs):
     device that holds a lease is sent one datagram, the kernel asks it by ARP, and after `_PROBE_WAIT_S` the table is read again: only a
     REACHABLE entry with the device's own MAC counts. A device with no current lease has no address to ask and is a miss as before; when
     nothing could be sent or the table cannot be read both sets are empty, so every device is a miss, which is also what it was before.
-    At most `_PROBE_MAX` are asked a pass (`probe_batch`); a device that is `waiting` is neither seen nor missed on this pass."""
-    by_mac = {mac: ip for mac, (ip, _hostname) in _current_ip_hostname_bulk(macs).items() if ip}
-    addresses, _probe_rotation["next"] = probe_batch(by_mac.values(), _probe_rotation["next"], _PROBE_MAX)
+    At most `_PROBE_MAX` are asked a pass (`probe_batch`); a device that is `waiting` is neither seen nor missed on this pass.
+
+    v1.2.8 (BG2) - when the lease lookup FAILED (Kea's database away) nobody can be asked, and that is not "no device holds a lease":
+    every device is `waiting`, so no miss is counted on this pass. 1.2.7 counted a miss for all of them and after three passes
+    published every device offline, the ones that would have answered included.
+
+    v1.2.8 (BG4) - the batch is the addresses asked longest ago (`probe_batch`). An address is stamped with the number of this pass
+    only after `_send_probes` reported that something was sent, so a pass that could send nothing uses up nobody's turn."""
+    try:
+        leases = _current_ip_hostname_bulk(macs, strict=True)
+    except _LeaseLookupFailed:
+        logger.warning("Presence: the lease lookup failed - no device is counted as missed on this pass")
+        return set(), set(macs)
+    by_mac = {mac: ip for mac, (ip, _hostname) in leases.items() if ip}
+    _probe_rotation["pass"] += 1
+    asked_at = _probe_rotation["asked"]
+    addresses = probe_batch(by_mac.values(), asked_at, _PROBE_MAX)
     if not addresses or not _send_probes(addresses):
         return set(), set()
+    for ip in addresses:
+        asked_at[ip] = _probe_rotation["pass"]
+    if len(asked_at) > _ASKED_KEEP:
+        for ip in sorted(asked_at, key=asked_at.get)[: len(asked_at) - _ASKED_KEEP]:
+            del asked_at[ip]
     time.sleep(_PROBE_WAIT_S)
     try:
         result = subprocess.run([ip_bin, "-4", "neigh", "show"], capture_output=True, text=True, timeout=10)
@@ -1132,6 +1167,7 @@ def _neighbor_tick():
             seen_by_mac[mac] = True
     # v1.2.7 - a device that was not asked on this pass (more unseen devices than one pass asks) is neither seen nor missed:
     # its state and its miss count stay as they are until its turn. A miss is counted only for a device that was asked.
+    # v1.2.8 (BG2) - the same when the lease lookup failed: every unseen device waits, and only the seen ones are written.
     tracked = [mac for mac in tracked if mac not in waiting]
     if not tracked:
         return

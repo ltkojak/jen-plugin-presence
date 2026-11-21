@@ -1,5 +1,25 @@
 # Presence Plugin — Changelog
 
+## [1.2.8] - 2026-11-21
+
+Two fixes, from the executing pass on Jen 7.2.0-beta.4 (BG2, BG4). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.
+
+### Fixed: with Kea's lease database away, every device on the Jen host's network was called offline (BG2)
+
+A tracked device the neighbor table does not show is asked on the address of its lease, so the pass reads the leases first. When that read failed (Kea's database away or unreachable), the answer was an empty list, which reads the same as "no device holds a lease". No device was asked, every one took a miss, and after three passes, fifteen minutes, every unseen device was published offline, the ones that were at home and would have answered included. In the executing pass that was 10 of 10.
+
+A lease lookup that failed is now told apart from one that found nothing. When it fails, the pass logs one warning and counts no miss for any unseen device: their state and their miss counts stay as they are until the leases can be read again. A device the first read of the neighbor table already shows is still marked seen on that pass. When the lookup answered and a device holds no lease, that device is a miss, as before.
+
+### Fixed: with the number of unseen devices changing from pass to pass, a device could go unasked for hours (BG4)
+
+Since 1.2.7, with more than 64 unseen devices each pass asked the next 64 in address order. "Next" was a position in the ordered list, and the list is a different length on every pass, so the position pointed at a different device each time. With the unseen set alternating between 187 and 126 devices, one device was asked twice in 200 passes, about 17 hours. A device that is not asked is neither seen nor missed, so one that had left stayed online all that time. No device that answers was called offline by this.
+
+The pass now remembers when each address was last asked and asks the ones asked longest ago first; an address never asked goes before all of them, and addresses asked on the same pass go in numeric order. Whether a device gets its turn no longer depends on what the other devices do: a device that stays unseen is asked again within the number of passes it takes to ask everyone once, plus one. In the same alternating case the longest wait is now 3 passes, and with 300 devices of which 0 to 200 are seen on any pass it is 5. An address is marked as asked only when the datagrams could be sent, so a pass that could send nothing uses up nobody's turn. The memory is kept in the running process, is limited to 4096 addresses, and starts again after a restart. The limit of 64 datagrams a pass is unchanged, and up to 64 unseen devices nothing changes.
+
+### The harness
+
+`tools/test_plugin.py` runs the real pass with the real lease lookup against a Kea database that raises: ten unseen devices take no miss in three passes and nothing is written for them, while a device the first read shows is still marked seen; and with the lookup answering, the one device with no lease is offline at its third miss. It checks the order `probe_batch` gives (never asked, then longest ago, ties numeric, its argument unchanged), and runs the real `_confirmed_by_probe` over 200 passes of the alternating case and 400 passes of seeded churn on 300 devices, holding the longest wait to 4 and 6 passes. It checks that nothing is marked when nothing could be sent, and that the memory stops at 4096 addresses. The 1.2.7 checks of the position rule are replaced.
+
 ## [1.2.7] - 2026-11-20
 
 One fix, from the executing pass on Jen 7.2.0-beta.3 (BF1). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.
