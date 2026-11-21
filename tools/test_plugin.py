@@ -1694,6 +1694,106 @@ def main():
         "index.html: each tracked row carries Jen's Investigate macro, given its MAC",
     )
 
+    # ── 1.2.7: with more unseen devices than one pass asks, every device is asked in turn and none is missed unasked ──
+    check(
+        p.probe_batch(["10.0.0.100", "10.0.0.11", "10.0.0.9"], 0, 64) == (["10.0.0.9", "10.0.0.11", "10.0.0.100"], 0),
+        "probe_batch: addresses are ordered as numbers, not as text, and a short list is asked whole",
+    )
+    hundred = [f"10.1.0.{n}" for n in range(1, 101)]
+    first, nxt = p.probe_batch(hundred, 0, 64)
+    second, nxt2 = p.probe_batch(hundred, nxt, 64)
+    check(
+        first == hundred[:64] and nxt == 64 and second == hundred[64:] + hundred[:28] and nxt2 == 28,
+        f"probe_batch: the batch moves on by 64 each pass and wraps (got next {nxt}, then {nxt2})",
+    )
+    check(set(first) | set(second) == set(hundred), "probe_batch: two passes ask all 100 devices")
+    check(p.probe_batch([], 5, 64) == ([], 0), "probe_batch: nothing to ask")
+
+    many = load_plugin()
+    macs = {f"aa:bb:cc:dd:{n // 256:02x}:{n % 256:02x}": f"10.1.0.{n}" for n in range(1, 101)}
+    answering = dict.fromkeys(macs, True)
+    asked_log, moved_many, tables = [], [], []
+
+    def _table(state_of):
+        return "".join(f"{ip} dev eth0 lladdr {mac} {state_of(mac)}\n" for mac, ip in macs.items())
+
+    class _NeighMany:
+        returncode = 0
+
+        def __init__(self):
+            self.stdout = tables.pop(0)
+
+    many._tracked_macs = lambda: set(macs)
+    many._ip_binary = lambda: "ip"
+    many._local_networks = lambda ip_bin: nets
+    many._local_macs = lambda tracked, local_nets: set(tracked)
+    many._current_ip_hostname_bulk = lambda asked: {mac: (macs[mac], "") for mac in asked}
+    many._send_probes = lambda addresses: (asked_log.append(list(addresses)), len(addresses))[1]
+    many._PROBE_WAIT_S = 0
+    many.subprocess = types.SimpleNamespace(run=lambda *a, **k: _NeighMany(), TimeoutExpired=Exception)
+    many._apply_transition = lambda mac, online: moved_many.append((mac, online))
+    touched = []
+    for _pass in range(6):
+        asked_now = set()
+
+        def _second_read(mac, asked_now=asked_now):
+            return "REACHABLE" if answering[mac] and macs[mac] in asked_now else "STALE"
+
+        tables[:] = [_table(lambda mac: "STALE")]
+        real_send = many._send_probes
+
+        def _send(addresses, asked_now=asked_now, real_send=real_send):
+            asked_now.update(addresses)
+            tables.append(_table(_second_read))
+            return real_send(addresses)
+
+        many._send_probes = _send
+        db = FakeDB([[{"mac": mac, "online": 1, "misses": 2} for mac in macs]])
+        many._get_db = lambda db=db: db
+        many._neighbor_tick()
+        many._send_probes = real_send
+        touched.append({st[2][-1] for st in db.statements if st[0] == "UPDATE"})
+    check(
+        all(len(batch) == 64 for batch in asked_log) and set(asked_log[0]) | set(asked_log[1]) == set(macs.values()),
+        f"_neighbor_tick: 100 unseen devices are asked 64 a pass, and all of them within two passes (got {[len(b) for b in asked_log]})",
+    )
+    check(
+        moved_many == [],
+        f"_neighbor_tick: with two misses each already, no device that answers is called offline over six passes (got {len(moved_many)} offline)",
+    )
+    waiting_first = {mac for mac, ip in macs.items() if ip not in set(asked_log[0])}
+    check(
+        len(waiting_first) == 36 and not (touched[0] & waiting_first),
+        "_neighbor_tick: the 36 devices not asked on the first pass get no miss and no write on that pass",
+    )
+    gone = "aa:bb:cc:dd:00:64"  # 10.1.0.100: past the first 64, and it has left
+    answering[gone] = False
+    moved_many.clear()
+    many._probe_rotation["next"] = 0
+    for _pass in range(3):
+        asked_now = set()
+
+        def _second_read(mac, asked_now=asked_now):
+            return "REACHABLE" if answering[mac] and macs[mac] in asked_now else "STALE"
+
+        tables[:] = [_table(lambda mac: "STALE")]
+        real_send = many._send_probes
+
+        def _send(addresses, asked_now=asked_now, real_send=real_send):
+            asked_now.update(addresses)
+            tables.append(_table(_second_read))
+            return real_send(addresses)
+
+        many._send_probes = _send
+        db = FakeDB([[{"mac": mac, "online": 1, "misses": 2} for mac in macs]])
+        many._get_db = lambda db=db: db
+        many._neighbor_tick()
+        many._send_probes = real_send
+    check(
+        moved_many == [(gone, False)],
+        f"_neighbor_tick: a device past the first 64 that has left is still called offline, on the pass that asks it (got {moved_many})",
+    )
+
     if failures:
         print(f"\n{len(failures)} check(s) failed")
         return 1

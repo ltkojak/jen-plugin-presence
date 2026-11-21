@@ -1056,25 +1056,48 @@ def _send_probes(addresses):
     return sent
 
 
+def probe_batch(addresses, start, limit):
+    """Pure: `(batch, next_start)` - the at most `limit` of `addresses` to ask on this pass, and where the next pass begins.
+
+    v1.2.7 - 1.2.6 sorted the addresses as TEXT and took the first 64, which is the same 64 on every pass (`10.0.0.100` sorts
+    before `10.0.0.11`): with more unseen devices than that, the ones past the cut were never asked, took a miss on every pass
+    and were published offline although they would have answered. The addresses are ordered as numbers and the batch moves on
+    by `limit` each pass, wrapping round, so every device is asked in turn."""
+    ordered = sorted(set(addresses), key=lambda ip: tuple(int(part) for part in ip.split(".")))
+    if len(ordered) <= limit:
+        return ordered, 0
+    start %= len(ordered)
+    return (ordered + ordered)[start : start + limit], (start + limit) % len(ordered)
+
+
+_probe_rotation = {
+    "next": 0
+}  # where the next pass's batch begins; in memory only, a restart begins again at the first address
+
+
 def _confirmed_by_probe(ip_bin, macs):
-    """v1.2.6 (PR-1) - the subset of `macs` that answer when asked. The first read of the neighbor table shows a device only when the Jen
+    """v1.2.6 (PR-1) - `(confirmed, waiting)`: the subset of `macs` that answer when asked, and (v1.2.7) the subset that hold a lease
+    and were NOT asked on this pass because the batch was full. The first read of the neighbor table shows a device only when the Jen
     host itself exchanged traffic with it in the last half minute or so; a phone at home that Jen never talks to is STALE or absent, so
     it missed every pass, was published offline after three, and a lease renewal (which is no event) never brought it back. Each such
     device that holds a lease is sent one datagram, the kernel asks it by ARP, and after `_PROBE_WAIT_S` the table is read again: only a
     REACHABLE entry with the device's own MAC counts. A device with no current lease has no address to ask and is a miss as before; when
-    nothing could be sent or the table cannot be read the answer is the empty set, which is also what it was before."""
-    addresses = sorted({ip for ip, _hostname in _current_ip_hostname_bulk(macs).values() if ip})[:_PROBE_MAX]
+    nothing could be sent or the table cannot be read both sets are empty, so every device is a miss, which is also what it was before.
+    At most `_PROBE_MAX` are asked a pass (`probe_batch`); a device that is `waiting` is neither seen nor missed on this pass."""
+    by_mac = {mac: ip for mac, (ip, _hostname) in _current_ip_hostname_bulk(macs).items() if ip}
+    addresses, _probe_rotation["next"] = probe_batch(by_mac.values(), _probe_rotation["next"], _PROBE_MAX)
     if not addresses or not _send_probes(addresses):
-        return set()
+        return set(), set()
     time.sleep(_PROBE_WAIT_S)
     try:
         result = subprocess.run([ip_bin, "-4", "neigh", "show"], capture_output=True, text=True, timeout=10)
     except Exception as e:
         logger.warning(f"Presence: could not read the neighbour table after the probe: {e}")
-        return set()
+        return set(), set()
     if result.returncode != 0:
-        return set()
-    return confirmed_macs(result.stdout) & set(macs)
+        return set(), set()
+    asked = set(addresses)
+    return confirmed_macs(result.stdout) & set(macs), {mac for mac, ip in by_mac.items() if ip not in asked}
 
 
 def _neighbor_tick():
@@ -1102,9 +1125,16 @@ def _neighbor_tick():
         return
     seen_by_mac = parse_neighbor_table(result.stdout if result.returncode == 0 else "")
     unseen = [mac for mac in tracked if not seen_by_mac.get(mac)]
+    waiting = set()
     if unseen:
-        for mac in _confirmed_by_probe(ip_bin, unseen):
+        confirmed, waiting = _confirmed_by_probe(ip_bin, unseen)
+        for mac in confirmed:
             seen_by_mac[mac] = True
+    # v1.2.7 - a device that was not asked on this pass (more unseen devices than one pass asks) is neither seen nor missed:
+    # its state and its miss count stay as they are until its turn. A miss is counted only for a device that was asked.
+    tracked = [mac for mac in tracked if mac not in waiting]
+    if not tracked:
+        return
 
     db = None
     try:

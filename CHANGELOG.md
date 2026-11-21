@@ -1,5 +1,17 @@
 # Presence Plugin — Changelog
 
+## [1.2.7] - 2026-11-20
+
+One fix, from the executing pass on Jen 7.2.0-beta.3 (BF1). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.
+
+### Fixed: with more than 64 unseen devices, every device is asked in turn
+
+Since 1.2.6 a tracked device the neighbor table does not show is asked before it counts as a miss, at most 64 devices a pass. The 64 were chosen by sorting the addresses as text and taking the first 64, which is the same 64 on every pass (`10.0.0.100` sorts before `10.0.0.11`). With more unseen devices than that, the ones past the cut were never asked, took a miss on every pass and were published offline after three, although they would have answered. This needs more than 64 tracked devices on the Jen host's own networks that the host is not talking to at the same time.
+
+The addresses are now ordered as numbers, and each pass asks the next 64, wrapping round. A device that was not asked on a pass is neither seen nor missed on it: its state and its miss count wait for its turn. A miss is counted only for a device that was asked, or that has no lease to ask it on. The limit of 64 datagrams a pass is unchanged.
+
+One consequence to know: with many unseen devices a device that has left is called offline later than fifteen minutes. With 200 unseen devices each one is asked every fourth pass, so three misses take about an hour. Up to 64 unseen devices nothing changes.
+
 ## [1.2.6] - 2026-11-20
 
 One fix, from the plugin audit for Jen 7.2.0 (PR-1). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.
