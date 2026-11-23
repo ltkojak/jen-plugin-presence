@@ -246,7 +246,7 @@ def main():
     check(p.parse_mqtt_url("http://host") is None, "parse_mqtt_url: a non-mqtt scheme is refused")
     check(p.parse_mqtt_url("") is None, "parse_mqtt_url: an empty string is refused")
 
-    # ── neighbour-table parsing (the same shape Network Discovery reads) ─────
+    # ── neighbor-table parsing (the same shape Network Discovery reads) ─────
     neigh_text = (
         "10.0.0.5 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"
         "10.0.0.6 dev eth0 lladdr 11:22:33:44:55:66 STALE\n"
@@ -516,7 +516,7 @@ def main():
         "mqtt_discovery_payload: json_attributes_topic points at the attributes topic",
     )
 
-    # ── 1.0.1: which devices can the neighbour table see at all ──────────────
+    # ── 1.0.1: which devices can the neighbor table see at all ──────────────
     ip_addr_out = (
         "1: lo    inet 127.0.0.1/8 scope host lo\n"
         "2: eth0    inet 10.1.0.5/24 brd 10.1.0.255 scope global eth0\n"
@@ -914,7 +914,7 @@ def main():
     check("UPDATE" not in fdb.kinds(), "move_subnet: a device that is not tracked is not found")
     p.request = None
 
-    # the neighbour pass asks where the device is NOW; the owner subnet is only the last resort
+    # the neighbor pass asks where the device is NOW; the owner subnet is only the last resort
     p._tracked_subnets = lambda: {"aa:bb:cc:dd:ee:01": 2}
     p._current_ip_hostname_bulk = lambda macs: dict.fromkeys(macs, (None, None))
     nets = [_ip.IPv4Network("10.1.0.0/24")]
@@ -1005,7 +1005,7 @@ def main():
         "_send_to_sink: a webhook sink now sends its bearer token, and a test body is marked test",
     )
 
-    # ── 1.0.1: the neighbour pass only counts misses for hosts on its own segments ─
+    # ── 1.0.1: the neighbor pass only counts misses for hosts on its own segments ─
     transitions = []
     p._tracked_macs = lambda: {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"}
     p._ip_binary = lambda: "ip"
@@ -1074,7 +1074,7 @@ def main():
         m._local_networks = lambda ip_bin: nets
         m._local_macs = lambda tracked, local_nets: set(tracked)
         m._current_ip_hostname_bulk = lambda macs, strict=False: dict(leases)
-        m._send_probes = lambda addresses: (probed.extend(addresses), len(addresses) if sendable else 0)[1]
+        m._send_probes = lambda addresses: (probed.extend(addresses), set(addresses) if sendable else set())[1]
         m._PROBE_WAIT_S = 0
         m.subprocess = types.SimpleNamespace(run=lambda *a, **k: _Neigh(), TimeoutExpired=Exception)
         db = FakeDB([[{"mac": "aa:bb:cc:dd:ee:01", "online": 1, "misses": misses}]])
@@ -1115,8 +1115,8 @@ def main():
     )
     probe_module = load_plugin()
     check(
-        probe_module._send_probes(["127.0.0.1", "not an address"]) == 1,
-        "_send_probes: the real function sends one datagram to an address and passes over one that is not",
+        probe_module._send_probes(["127.0.0.1", "not an address"]) == {"127.0.0.1"},
+        "_send_probes (BI8): the real function sends one datagram to an address, passes over one that is not, and answers the set it sent to",
     )
     check(
         (probe_module._PROBE_PORT, probe_module._PROBE_WAIT_S, probe_module._PROBE_MAX) == (9, 9, 64),
@@ -1754,7 +1754,7 @@ def main():
     many._local_networks = lambda ip_bin: nets
     many._local_macs = lambda tracked, local_nets: set(tracked)
     many._current_ip_hostname_bulk = lambda asked, strict=False: {mac: (macs[mac], "") for mac in asked}
-    many._send_probes = lambda addresses: (asked_log.append(list(addresses)), len(addresses))[1]
+    many._send_probes = lambda addresses: (asked_log.append(list(addresses)), set(addresses))[1]
     many._PROBE_WAIT_S = 0
     many.subprocess = types.SimpleNamespace(run=lambda *a, **k: _NeighMany(), TimeoutExpired=Exception)
     many._apply_transition = lambda mac, online: moved_many.append((mac, online))
@@ -1892,7 +1892,7 @@ def main():
                     for mac, ip in devices.items()
                 )
             )
-            return len(addresses)
+            return set(addresses)
 
         def _offline(mac, online):
             moved.append((mac, online))
@@ -1966,7 +1966,7 @@ def main():
 
         def _send(addresses):
             batches[-1] = list(addresses)
-            return len(addresses) if sendable(len(batches)) else 0
+            return set(addresses) if sendable(len(batches)) else set()
 
         r._current_ip_hostname_bulk = lambda macs, strict=False: {
             mac: (mac, "") for mac in macs
@@ -2025,11 +2025,11 @@ def main():
     )
     silent = load_plugin()
     silent._current_ip_hostname_bulk = lambda macs, strict=False: {mac: (mac, "") for mac in macs}
-    silent._send_probes = lambda addresses: 0
+    silent._send_probes = lambda addresses: set()
     check(
         silent._confirmed_by_probe("ip", pool[:100]) == (set(), set(pool[:100]))
         and silent._probe_rotation == {"pass": 1, "asked": {}},
-        f"_confirmed_by_probe (BG4, BH3): when _send_probes answers 0 the pass is counted, no address is stamped and all 100 wait (got {silent._probe_rotation['pass']}, {len(silent._probe_rotation['asked'])} stamped)",
+        f"_confirmed_by_probe (BG4, BH3): when _send_probes sent to nobody the pass is counted, no address is stamped and all 100 wait (got {silent._probe_rotation['pass']}, {len(silent._probe_rotation['asked'])} stamped)",
     )
     _batches, _longest, r = rotation_world(lambda number: pool[:100], 2)
     check(
@@ -2043,7 +2043,7 @@ def main():
     old_addresses = [f"10.{a}.{b}.{c}" for a in (8, 9) for b in range(16) for c in range(1, 129)]
     full._probe_rotation.update({"pass": 5000, "asked": {ip: n + 1 for n, ip in enumerate(old_addresses)}})
     full._current_ip_hostname_bulk = lambda macs, strict=False: {mac: (mac, "") for mac in macs}
-    full._send_probes = len
+    full._send_probes = set
     full._PROBE_WAIT_S = 0
 
     class _NoTable:
@@ -2066,7 +2066,7 @@ def main():
         """The real `_neighbor_tick`, `_confirmed_by_probe`, `probe_batch` and `_current_ip_hostname_bulk`, `passes` times, over `count`
         devices recorded online. Each holds a lease (but the ones in `absent`) and answers when it is asked (but the ones in `gone`);
         the ones in `shown` are REACHABLE on the first read already. `failure(n)` is what goes wrong on pass n: "send" (the sender
-        answers 0), "raise" (the neighbor read after the probe raises), "rc" (it exits non-zero) or None. Only the databases, the
+        sends to nobody), "raise" (the neighbor read after the probe raises), "rc" (it exits non-zero) or None. Only the databases, the
         sender, the wait and `ip neigh` are stood in. Returns (transitions, the state store, the devices)."""
         w = load_plugin()
         devices = {
@@ -2094,7 +2094,7 @@ def main():
 
         def _send(addresses):
             now["asked"] = set(addresses)
-            return 0 if failure(now["pass"]) == "send" else len(addresses)
+            return set() if failure(now["pass"]) == "send" else set(addresses)
 
         def _transition(mac, online):
             moved.append((mac, online))
@@ -2154,7 +2154,7 @@ def main():
     )
     stamped = load_plugin()
     stamped._current_ip_hostname_bulk = lambda macs, strict=False: {mac: (mac, "") for mac in macs}
-    stamped._send_probes = lambda addresses: 1  # one datagram of the 64 went out
+    stamped._send_probes = lambda addresses: set(addresses[:1])  # one datagram of the 64 went out
     stamped._PROBE_WAIT_S = 0
     stamped.subprocess = types.SimpleNamespace(run=lambda *a, **k: _NoTable(), TimeoutExpired=Exception)
     answer = stamped._confirmed_by_probe("ip", pool[:100])
@@ -2169,6 +2169,158 @@ def main():
         "every device is a miss" not in (stamped._confirmed_by_probe.__doc__ or "")
         and "v1.2.9 (BH3)" in (stamped._confirmed_by_probe.__doc__ or ""),
         "_confirmed_by_probe (BH3): its docstring no longer says every device is a miss when nothing could be sent",
+    )
+
+    # ── 1.2.10 (BI8): a device whose own datagram could not be sent was not asked ─────────────────────────────────
+    def socket_world(count, refused, passes=3, gone=()):
+        """The real `_neighbor_tick`, `_confirmed_by_probe`, `_send_probes`, `probe_batch` and `_current_ip_hostname_bulk`, `passes`
+        times, over `count` devices recorded online, each with a lease. The SOCKET is stood in: `sendto` raises PermissionError for
+        an address in `refused` and records every other. A device answers (REACHABLE on the read after the probe) when its datagram
+        left and it is not in `gone`. Also stood in: the databases, `ip` and the wait. Returns (transitions, the state store, the
+        devices, the addresses whose datagram left on each pass, the module)."""
+        w = load_plugin()
+        devices = {
+            f"aa:bb:cc:dd:{n // 256:02x}:{n % 256:02x}": f"10.1.{n // 250}.{n % 250 + 1}" for n in range(1, count + 1)
+        }
+        moved, left, slept = [], [], []
+        store = _StateDB(devices)
+        now = {"reads": 0}
+
+        class _Socket:
+            def setblocking(self, flag):
+                pass
+
+            def sendto(self, data, where):
+                if where[0] in refused:
+                    raise PermissionError(1, "Operation not permitted")
+                left[-1].add(where[0])
+
+            def close(self):
+                pass
+
+        def _table(asked):
+            return "".join(
+                f"{ip} dev eth0 lladdr {mac} {'REACHABLE' if ip in asked and mac not in gone else 'STALE'}\n"
+                for mac, ip in devices.items()
+            )
+
+        def _run(*a, **k):
+            now["reads"] += 1
+            return types.SimpleNamespace(returncode=0, stdout=_table(set() if now["reads"] == 1 else left[-1]))
+
+        def _transition(mac, online):
+            moved.append((mac, online))
+            store.state[mac].update(online=1 if online else 0, misses=0)
+
+        w._tracked_macs = lambda: set(devices)
+        w._ip_binary = lambda: "ip"
+        w._local_networks = lambda ip_bin: nets
+        w._local_macs = lambda tracked, local_nets: set(tracked)
+        w._get_kea_db = lambda: _KeaDB(
+            [{"mac_hex": mac.replace(":", "").upper(), "ip": ip, "hostname": ""} for mac, ip in devices.items()]
+        )
+        w.socket = types.SimpleNamespace(AF_INET=2, SOCK_DGRAM=2, socket=lambda *a: _Socket())
+        w.time = types.SimpleNamespace(sleep=slept.append)
+        w.subprocess = types.SimpleNamespace(run=_run, TimeoutExpired=Exception)
+        w._get_db = lambda: store
+        w._apply_transition = _transition
+        for _number in range(passes):
+            now["reads"] = 0
+            left.append(set())
+            w._neighbor_tick()
+        return moved, store, devices, left, w
+
+    forty = [f"10.1.0.{n}" for n in range(2, 42)]  # the addresses of socket_world(40, ...)
+    five = set(forty[:5])
+    moved, store, devices, left, w = socket_world(40, five)
+    unsent = [mac for mac, ip in devices.items() if ip in five]
+    check(
+        moved == []
+        and all(len(batch) == 35 and not (batch & five) for batch in left)
+        and len(unsent) == 5
+        and all(store.state[mac] == {"mac": mac, "online": 1, "misses": 0} for mac in unsent)
+        and not [write for write in store.writes if write[1] in unsent],
+        f"_neighbor_tick (BI8): sendto raising for 5 of 40 addresses on three passes - those 5 take no miss, are not called offline and "
+        f"nothing is written for them (got {len(moved)} offline, misses {sorted({store.state[mac]['misses'] for mac in unsent})}; 1.2.9: 5 offline)",
+    )
+    check(
+        all(row["misses"] == 0 and row["online"] == 1 for row in store.state.values())
+        and sorted(write[1] for write in store.writes if write[0] == "seen")
+        == sorted([mac for mac in devices if mac not in unsent] * 3),
+        "_neighbor_tick (BI8): the other 35, whose datagram left and who answered, are marked seen on each of the three passes",
+    )
+    check(
+        w._probe_rotation == {"pass": 3, "asked": dict.fromkeys(forty, 3)},
+        "_confirmed_by_probe (BI8): the 5 addresses that could not be sent to are stamped with the pass like the rest of their batch "
+        "- the marking is as it was",
+    )
+    left_mac, refused_mac = "aa:bb:cc:dd:00:28", "aa:bb:cc:dd:00:01"
+    moved, store, devices, left, w = socket_world(40, five, gone={left_mac, refused_mac})
+    check(
+        moved == [(left_mac, False)] and store.state[refused_mac] == {"mac": refused_mac, "online": 1, "misses": 0},
+        f"_neighbor_tick (BI8): with 5 of 40 unsendable, a device whose datagram left and who did not answer takes its miss as before "
+        f"and is offline at its third; a silent device that was never asked is not (got {moved})",
+    )
+    moved, store, devices, left, w = socket_world(40, five, passes=1, gone={left_mac})
+    check(
+        [mac for mac, row in store.state.items() if row["misses"]] == [left_mac]
+        and store.state[left_mac]["misses"] == 1,
+        "_neighbor_tick (BI8): on one such pass only the device that was asked and did not answer takes a miss",
+    )
+    moved, store, devices, left, w = socket_world(40, set(forty), gone={left_mac})
+    check(
+        moved == []
+        and store.writes == []
+        and left == [set(), set(), set()]
+        and w._probe_rotation == {"pass": 3, "asked": {}},
+        f"_neighbor_tick (BI8): sendto raising for all 40 is as it was - nobody takes a miss, nothing is written, nobody is stamped "
+        f"(got {len(moved)} offline, {len(store.writes)} writes)",
+    )
+    moved, store, devices, left, w = socket_world(40, set(), gone={left_mac})
+    check(
+        moved == [(left_mac, False)]
+        and all(batch == set(forty) for batch in left)
+        and len([write for write in store.writes if write[0] == "seen"]) == 39 * 3,
+        f"_neighbor_tick (BI8): with every datagram sent it is as it was - 39 are seen on each pass and the one that left is offline "
+        f"at its third miss (got {moved})",
+    )
+    partial_log = []
+    w = load_plugin()
+    w._current_ip_hostname_bulk = lambda macs, strict=False: {mac: (mac, "") for mac in macs}
+    w._send_probes = lambda addresses: set(addresses[2:])
+    w._PROBE_WAIT_S = 0
+    w.subprocess = types.SimpleNamespace(
+        run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=""), TimeoutExpired=Exception
+    )
+    w.logger = types.SimpleNamespace(warning=partial_log.append, error=partial_log.append, info=partial_log.append)
+    check(
+        w._confirmed_by_probe("ip", pool[:100]) == (set(), set(pool[:2]) | set(pool[64:100]))
+        and partial_log
+        == [
+            "Presence: the probe could not be sent to 2 of 64 addresses - those devices are not counted as missed on this pass"
+        ],
+        f"_confirmed_by_probe (BI8): of 100 unseen devices the 2 that could not be sent to wait with the 36 past the batch, and one "
+        f"warning says how many (got {partial_log})",
+    )
+
+    # ── 1.2.10: the words and the page (C17, C5, C7 of the reading of 7.2.0-beta.6's notes) ────────────────────────
+    source_1210 = pathlib.Path(ROOT, "plugin.py").read_text(encoding="utf-8")
+    readme_1210 = pathlib.Path(ROOT, "README.md").read_text(encoding="utf-8")
+    british = "neigh" + "bour"
+    check(
+        british not in source_1210.lower() and british not in readme_1210.lower() and "neighbor pass" in source_1210,
+        "plugin.py, README.md (C17): neighbor is spelled one way, the American one, in every comment, docstring, log line and sentence",
+    )
+    page_1210 = pathlib.Path(ROOT, "templates", "presence", "index.html").read_text(encoding="utf-8")
+    check(
+        'data-confirm="Remove {{ s.name }}?" data-confirm-label="Remove">' in page_1210
+        and page_1210.count("data-confirm-label=") == 1,
+        "index.html (C5): the dialog that removes a destination has a button that says Remove",
+    )
+    mac_field = re.search(r'<input type="text" name="mac"[^>]*>', page_1210).group(0)
+    check(
+        all(attr in mac_field for attr in ('autocapitalize="off"', 'autocomplete="off"', 'spellcheck="false"')),
+        "index.html (C7): the MAC field does not capitalize, complete or spell-check, like Jen's own MAC fields",
     )
 
     # ── 1.2.9: the page (V52, addition 11 of the look over 7.2.0-beta.5) ───────────────────────────────────────────

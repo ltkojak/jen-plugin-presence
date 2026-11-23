@@ -1,5 +1,29 @@
 # Presence Plugin — Changelog
 
+## [1.2.10] - 2026-11-23
+
+One fix, and three small corrections to the words and the page, from the executing pass on Jen 7.2.0-beta.6 (BI8, its reader's B4) and the reading of that release's notes against its pages (C5, C7, C17). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.
+
+### Fixed: a device whose own probe could not be sent was counted as not answering (BI8)
+
+A tracked device the neighbor table does not show is asked: Jen sends one datagram to the address of its lease, waits, and reads the table again. Since 1.2.9 a pass on which no datagram at all could be sent counts no miss. But the sender only said how many datagrams had left, not which. When the send was refused for some addresses of a batch and worked for the others, every device of the batch was treated as asked, and a device whose datagram never left was counted as "asked, did not answer". After three such passes, fifteen minutes, it was published offline although it was at home. In the executing pass that was 5 of 40 present devices, on 1.2.9 and on 1.2.8.
+
+The sender now answers with the addresses it sent to. A device whose datagram could not be sent was not asked: it takes no miss on that pass and its state stays as it is, exactly like every device on a pass that could send nothing. Jen logs one warning that says how many addresses of the batch could not be sent to. A device whose datagram left and who did not answer takes its miss, and is called offline at its third, as before. A pass on which nothing could be sent, and a pass on which everything was sent, behave as they did in 1.2.9. The addresses of a batch are still all marked as asked when at least one datagram of it left, so a device that could not be sent to waits for its turn like the rest and does not hold a place in every batch.
+
+### One spelling of neighbor (C17)
+
+The lines added in 1.2.9 say "neighbor" and the older ones around them said "neighbour", in five log lines of the periodic pass, in the comments and in three sentences of the README. They all say "neighbor" now. No name the code or Jen uses was spelled that way, so nothing but words changed. Earlier entries of this file are left as they were written.
+
+### The page: the dialog's button says Remove, and the MAC field leaves what is typed alone (C5, C7)
+
+The dialog that asks "Remove <destination>?" had a button that said "Confirm". It says "Remove" (on Jen 7.2.0-beta.6 or later, which reads the label; an older Jen shows "Confirm" as before).
+
+The MAC address field of the Track Device dialog now tells a phone's keyboard not to capitalize, complete or spell-check what is typed, the same three attributes Jen's own MAC fields carry.
+
+### The harness
+
+`tools/test_plugin.py` runs the real pass with the real sender over 40 present devices with a lease, with only the socket, `ip`, the databases and the wait stood in: with `sendto` raising for 5 of the 40 on three passes none of the 5 takes a miss or is called offline and the other 35 are marked seen (1.2.9: the 5 offline); a device among the 35 that has left is still offline at its third miss; with `sendto` raising for all 40, and for none, the result is what it was. It checks that the real sender answers the set of addresses it sent to, that the marking of a batch is as it was, that the warning says how many, and reads the page and the source for the label, the field's attributes and the spelling. Every stand-in for the sender in the older checks now answers a set.
+
 ## [1.2.9] - 2026-11-22
 
 One fix, one correction to the notes and the page, from the executing pass on Jen 7.2.0-beta.5 (BH3, BH6) and the look over its pages (V52 and addition 11 of that review). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.

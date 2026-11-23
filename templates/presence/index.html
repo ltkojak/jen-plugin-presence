@@ -157,7 +157,7 @@
                     <button type="submit" class="btn btn-sm btn-secondary">{{ 'Pause' if s.enabled else 'Enable' }}</button>
                 </form>
                 <form method="POST" action="{{ url_for('presence.delete_sink', sink_id=s.id) }}" class="contents"
-                      data-confirm="Remove {{ s.name }}?">
+                      data-confirm="Remove {{ s.name }}?" data-confirm-label="Remove">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="btn btn-sm btn-secondary bad">{{ icon("trash") }}</button>
                 </form>
@@ -184,7 +184,7 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="form-group">
             <label>MAC address</label>
-            <input type="text" name="mac" id="pr-mac" list="pr-candidates" class="mono" placeholder="aa:bb:cc:dd:ee:ff" required autocomplete="off">
+            <input type="text" name="mac" id="pr-mac" list="pr-candidates" class="mono" placeholder="aa:bb:cc:dd:ee:ff" required autocapitalize="off" autocomplete="off" spellcheck="false">
             <datalist id="pr-candidates">
                 {% for c in candidates %}
                 <option value="{{ c.mac }}">{{ c.label or c.mac }}</option>

@@ -61,14 +61,14 @@ Design notes
 **Two debounce regimes, on purpose.** A lease event (`lease.new`/
 `lease.expired`) is itself a transition — Kea has already decided the
 device is there or gone, so it's applied immediately, no debounce. The
-periodic neighbour-table pass is a fuzzier signal (a phone can miss
+periodic neighbor-table pass is a fuzzier signal (a phone can miss
 one ARP probe cycle for all sorts of reasons), so `next_presence_state()`
 below only flips an online device offline after
 `_OFFLINE_MISS_THRESHOLD` CONSECUTIVE passes that didn't see it — a
 single missed pass never flips it early. Any sighting, from either
 signal, flips a device online at once.
 
-**Only what Jen can see from where it sits (v1.0.1).** The neighbour pass reads
+**Only what Jen can see from where it sits (v1.0.1).** The neighbor pass reads
 `ip -4 neigh`, which only ever holds hosts on a segment the Jen host has an
 interface on. A tracked device anywhere else was never in it, so it "missed" three
 passes and went offline fifteen minutes after joining, and stayed there (a renewal
@@ -295,13 +295,13 @@ def mqtt_client_id(mac):
     return f"jen-pr-{mac.replace(':', '')}"
 
 
-# ── Pure: neighbour-table parsing, the offline debounce ─────────────────────────
+# ── Pure: neighbor-table parsing, the offline debounce ─────────────────────────
 
 
 def parse_neighbor_table(text):
     """Pure: `ip -4 neigh show` output -> {mac: seen}. A line like
     '10.0.0.5 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE' — the same
-    shape Network Discovery's own neighbour read parses. `seen=True`
+    shape Network Discovery's own neighbor read parses. `seen=True`
     only for REACHABLE/DELAY/PROBE (per the design: actively confirmed
     or being actively reconfirmed right now); STALE and everything
     else is NOT 'seen' for presence purposes, even though Discovery's
@@ -537,7 +537,7 @@ class _LeaseLookupFailed(Exception):
 
 def _current_ip_hostname_bulk(macs, strict=False):
     """{mac: (ip, hostname)} for every MAC in `macs` that currently holds an active lease, in ONE
-    query — `_local_macs` (behind both the neighbour pass and every page render of the tracked
+    query — `_local_macs` (behind both the neighbor pass and every page render of the tracked
     list) used to call `_current_ip_hostname` once per tracked MAC. Same rule as that function
     (state 0, not past expiry, newest lease wins); a MAC with no active lease is simply absent
     from the result rather than mapped to (None, None).
@@ -866,7 +866,7 @@ def _queue_publish(sink, mac, label, online, since_iso, ip, hostname):
 
 def _apply_transition(mac, online):
     """The one place a transition is recorded and published, whichever
-    signal (a lease event or the periodic neighbour pass) triggered
+    signal (a lease event or the periodic neighbor pass) triggered
     it."""
     db = None
     try:
@@ -983,7 +983,7 @@ def _on_lease_event(event):
     _apply_transition(mac, online)
 
 
-# ── Periodic neighbour-table pass ────────────────────────────────────────────
+# ── Periodic neighbor-table pass ────────────────────────────────────────────
 
 
 def _ip_binary():
@@ -1045,21 +1045,23 @@ def _local_macs(tracked, local_nets):
 
 
 def _send_probes(addresses):
-    """One empty UDP datagram to the discard port of each address; returns how many were sent. Nothing is read back and nothing needs to
-    listen there: sending makes the kernel resolve the address, which is what asks the device whether it is still there. Needs no
-    privilege and no extra program."""
+    """One empty UDP datagram to the discard port of each address; returns the set of addresses whose datagram was sent (empty when
+    none was). Nothing is read back and nothing needs to listen there: sending makes the kernel resolve the address, which is what
+    asks the device whether it is still there. Needs no privilege and no extra program.
+
+    v1.2.10 (BI8) - 1.2.9 and earlier returned a count, so the caller could not tell which addresses of a batch had been asked."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     except OSError as e:
         logger.warning(f"Presence: could not open a socket to probe with: {type(e).__name__}")
-        return 0
-    sent = 0
+        return set()
+    sent = set()
     try:
         sock.setblocking(False)
         for ip in addresses:
             try:
                 sock.sendto(b"", (ip, _PROBE_PORT))
-                sent += 1
+                sent.add(ip)
             except OSError:
                 continue
     finally:
@@ -1105,6 +1107,10 @@ def _confirmed_by_probe(ip_bin, macs):
     batch and the ones with no lease included, so no miss is counted on this pass. 1.2.6 to 1.2.8 returned two empty sets here, which
     counted a miss for every unseen device and after three such passes published all of them offline.
 
+    v1.2.10 (BI8) - the same for ONE device whose datagram could not be sent while others of the batch could: it was not asked, so it
+    is `waiting` and takes no miss on this pass. 1.2.9 and earlier counted it as asked and not answering whenever at least one datagram
+    of the batch went out. Its address is still stamped with the pass, like the rest of the batch, so it waits its turn like the rest.
+
     v1.2.8 (BG2) - when the lease lookup FAILED (Kea's database away) nobody can be asked, and that is not "no device holds a lease":
     every device is `waiting`, so no miss is counted on this pass. 1.2.7 counted a miss for all of them and after three passes
     published every device offline, the ones that would have answered included.
@@ -1122,9 +1128,15 @@ def _confirmed_by_probe(ip_bin, macs):
     addresses = probe_batch(by_mac.values(), asked_at, _PROBE_MAX)
     if not addresses:
         return set(), set()
-    if not _send_probes(addresses):
+    sent = _send_probes(addresses)
+    if not sent:
         logger.warning("Presence: the probe could not be sent - no device is counted as missed on this pass")
         return set(), set(macs)
+    if len(sent) < len(addresses):
+        logger.warning(
+            f"Presence: the probe could not be sent to {len(addresses) - len(sent)} of {len(addresses)} addresses - "
+            "those devices are not counted as missed on this pass"
+        )
     for ip in addresses:
         asked_at[ip] = _probe_rotation["pass"]
     if len(asked_at) > _ASKED_KEEP:
@@ -1143,7 +1155,7 @@ def _confirmed_by_probe(ip_bin, macs):
             "Presence: the neighbor table could not be read after the probe - no device is counted as missed on this pass"
         )
         return set(), set(macs)
-    asked = set(addresses)
+    asked = set(sent)
     return confirmed_macs(result.stdout) & set(macs), {mac for mac, ip in by_mac.items() if ip not in asked}
 
 
@@ -1153,14 +1165,14 @@ def _neighbor_tick():
         return
     ip_bin = _ip_binary()
     if not ip_bin:
-        logger.warning("Presence: no 'ip' binary found — skipping this neighbour pass")
+        logger.warning("Presence: no 'ip' binary found — skipping this neighbor pass")
         return
     local_nets = _local_networks(ip_bin)
     if not local_nets:
         # Without the host's own subnets a miss cannot be told from "not on my segment": count none.
-        logger.warning("Presence: could not determine the host's interface subnets — skipping this neighbour pass")
+        logger.warning("Presence: could not determine the host's interface subnets — skipping this neighbor pass")
         return
-    # Only a device on a segment this host has an interface on can ever appear in its neighbour table.
+    # Only a device on a segment this host has an interface on can ever appear in its neighbor table.
     # For every other device the state follows lease events alone.
     tracked = _local_macs(tracked, local_nets)
     if not tracked:
@@ -1168,7 +1180,7 @@ def _neighbor_tick():
     try:
         result = subprocess.run([ip_bin, "-4", "neigh", "show"], capture_output=True, text=True, timeout=10)
     except Exception as e:
-        logger.warning(f"Presence: could not read the neighbour table: {e}")
+        logger.warning(f"Presence: could not read the neighbor table: {e}")
         return
     seen_by_mac = parse_neighbor_table(result.stdout if result.returncode == 0 else "")
     unseen = [mac for mac in tracked if not seen_by_mac.get(mac)]
@@ -1198,7 +1210,7 @@ def _neighbor_tick():
             )
             states = {r["mac"]: r for r in cur.fetchall()}
     except Exception as e:
-        logger.error(f"Presence: could not read state for the neighbour pass: {e}")
+        logger.error(f"Presence: could not read state for the neighbor pass: {e}")
         return
     finally:
         if db:
@@ -1228,7 +1240,7 @@ def _neighbor_tick():
                     cur.execute("UPDATE pr_state SET last_seen=UTC_TIMESTAMP() WHERE mac=%s", (mac,))
         db.commit()
     except Exception as e:
-        logger.error(f"Presence: could not save neighbour-pass misses: {e}")
+        logger.error(f"Presence: could not save neighbor-pass misses: {e}")
     finally:
         if db:
             db.close()
