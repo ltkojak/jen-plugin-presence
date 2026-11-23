@@ -474,7 +474,7 @@ def _require_superadmin():
     client's state, so configuring one is a superadmin action (like Alerts channels)."""
     if is_superadmin():
         return True
-    flash("Sinks are global integration settings: only a superadmin can change them.", "error")
+    flash("Destinations are global integration settings: only a superadmin can change them.", "error")
     return False
 
 
@@ -1097,9 +1097,13 @@ def _confirmed_by_probe(ip_bin, macs):
     host itself exchanged traffic with it in the last half minute or so; a phone at home that Jen never talks to is STALE or absent, so
     it missed every pass, was published offline after three, and a lease renewal (which is no event) never brought it back. Each such
     device that holds a lease is sent one datagram, the kernel asks it by ARP, and after `_PROBE_WAIT_S` the table is read again: only a
-    REACHABLE entry with the device's own MAC counts. A device with no current lease has no address to ask and is a miss as before; when
-    nothing could be sent or the table cannot be read both sets are empty, so every device is a miss, which is also what it was before.
+    REACHABLE entry with the device's own MAC counts. A device with no current lease has no address to ask and is a miss as before.
     At most `_PROBE_MAX` are asked a pass (`probe_batch`); a device that is `waiting` is neither seen nor missed on this pass.
+
+    v1.2.9 (BH3) - when the question could not be put (`_send_probes` sent nothing) or its answer could not be read (the neighbor read
+    after it raised or failed), nobody was asked, and that is not "nobody answered": every device is `waiting`, the ones past the
+    batch and the ones with no lease included, so no miss is counted on this pass. 1.2.6 to 1.2.8 returned two empty sets here, which
+    counted a miss for every unseen device and after three such passes published all of them offline.
 
     v1.2.8 (BG2) - when the lease lookup FAILED (Kea's database away) nobody can be asked, and that is not "no device holds a lease":
     every device is `waiting`, so no miss is counted on this pass. 1.2.7 counted a miss for all of them and after three passes
@@ -1116,8 +1120,11 @@ def _confirmed_by_probe(ip_bin, macs):
     _probe_rotation["pass"] += 1
     asked_at = _probe_rotation["asked"]
     addresses = probe_batch(by_mac.values(), asked_at, _PROBE_MAX)
-    if not addresses or not _send_probes(addresses):
+    if not addresses:
         return set(), set()
+    if not _send_probes(addresses):
+        logger.warning("Presence: the probe could not be sent - no device is counted as missed on this pass")
+        return set(), set(macs)
     for ip in addresses:
         asked_at[ip] = _probe_rotation["pass"]
     if len(asked_at) > _ASKED_KEEP:
@@ -1127,10 +1134,15 @@ def _confirmed_by_probe(ip_bin, macs):
     try:
         result = subprocess.run([ip_bin, "-4", "neigh", "show"], capture_output=True, text=True, timeout=10)
     except Exception as e:
-        logger.warning(f"Presence: could not read the neighbour table after the probe: {e}")
-        return set(), set()
+        logger.warning(
+            f"Presence: could not read the neighbor table after the probe - no device is counted as missed on this pass: {e}"
+        )
+        return set(), set(macs)
     if result.returncode != 0:
-        return set(), set()
+        logger.warning(
+            "Presence: the neighbor table could not be read after the probe - no device is counted as missed on this pass"
+        )
+        return set(), set(macs)
     asked = set(addresses)
     return confirmed_macs(result.stdout) & set(macs), {mac for mac, ip in by_mac.items() if ip not in asked}
 
@@ -1168,6 +1180,7 @@ def _neighbor_tick():
     # v1.2.7 - a device that was not asked on this pass (more unseen devices than one pass asks) is neither seen nor missed:
     # its state and its miss count stay as they are until its turn. A miss is counted only for a device that was asked.
     # v1.2.8 (BG2) - the same when the lease lookup failed: every unseen device waits, and only the seen ones are written.
+    # v1.2.9 (BH3) - and the same when the probe could not be sent or the neighbor table could not be read after it.
     tracked = [mac for mac in tracked if mac not in waiting]
     if not tracked:
         return
@@ -1289,7 +1302,9 @@ def investigation_card(tracked, sink_names=None, now_in_label=""):
     if tracked.get("last_seen"):
         rows.append({"label": "Last seen", "value": _when(tracked["last_seen"])})
     if sink_names is not None:
-        rows.append({"label": "Published to", "value": ", ".join(sink_names) if sink_names else "no enabled sink"})
+        rows.append(
+            {"label": "Published to", "value": ", ".join(sink_names) if sink_names else "no enabled destination"}
+        )
     if now_in_label:
         rows.append({"label": "Now in", "value": now_in_label})
     return {"summary": summary, "status": "ok", "rows": rows}
@@ -1716,7 +1731,7 @@ def add_sink():
     name = request.form.get("name", "").strip()[:100]
     kind = request.form.get("kind", "")
     if kind not in ("ha_webhook", "mqtt", "http"):
-        flash("Pick a supported sink type.", "error")
+        flash("Pick a supported destination type.", "error")
         return redirect(url_for("presence.index"))
     url = request.form.get("url", "").strip()[:255]
     if not url:
@@ -1764,7 +1779,7 @@ def add_sink():
         _audit("PRESENCE_ADD_SINK", name, f"kind={kind}")
     except Exception as e:
         logger.error(f"Presence: could not add sink: {e}")
-        flash("Could not add the sink; the details are in Jen's log.", "error")
+        flash("Could not add the destination; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1783,15 +1798,15 @@ def toggle_sink(sink_id):
             cur.execute("SELECT enabled FROM pr_sinks WHERE id=%s", (sink_id,))
             row = cur.fetchone()
             if row is None:
-                flash("Sink not found.", "error")
+                flash("Destination not found.", "error")
                 return redirect(url_for("presence.index"))
             new_enabled = 0 if row["enabled"] else 1
             cur.execute("UPDATE pr_sinks SET enabled=%s WHERE id=%s", (new_enabled, sink_id))
         db.commit()
-        flash("Sink enabled." if new_enabled else "Sink paused.", "success")
+        flash("Destination enabled." if new_enabled else "Destination paused.", "success")
     except Exception as e:
         logger.error(f"Presence: could not update sink: {e}")
-        flash("Could not update the sink; the details are in Jen's log.", "error")
+        flash("Could not update the destination; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1809,11 +1824,11 @@ def delete_sink(sink_id):
         with db.cursor() as cur:
             cur.execute("DELETE FROM pr_sinks WHERE id=%s", (sink_id,))
         db.commit()
-        flash("Sink removed.", "success")
+        flash("Destination removed.", "success")
         _audit("PRESENCE_DELETE_SINK", str(sink_id), "sink removed")
     except Exception as e:
         logger.error(f"Presence: could not remove sink: {e}")
-        flash("Could not remove the sink; the details are in Jen's log.", "error")
+        flash("Could not remove the destination; the details are in Jen's log.", "error")
     finally:
         if db:
             db.close()
@@ -1838,7 +1853,7 @@ def test_sink(sink_id):
         if db:
             db.close()
     if not sink:
-        flash("Sink not found.", "error")
+        flash("Destination not found.", "error")
         return redirect(url_for("presence.index"))
     try:
         _send_to_sink(

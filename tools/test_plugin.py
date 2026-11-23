@@ -1103,10 +1103,10 @@ def main():
         moved == [("aa:bb:cc:dd:ee:01", False)] and probed == [] and reads == 1,
         f"_neighbor_tick (PR-1): a device with no lease has no address to ask and is a miss as before (got {moved}, {probed}, {reads} reads)",
     )
-    moved, _statements, probed, reads = neighbor_pass([stale], lease, sendable=False)
+    moved, statements, probed, reads = neighbor_pass([stale], lease, sendable=False)
     check(
-        moved == [("aa:bb:cc:dd:ee:01", False)] and reads == 1,
-        f"_neighbor_tick (PR-1): when nothing could be sent the table is not read again and the miss counts (got {moved}, {reads} reads)",
+        moved == [] and statements == [] and probed == ["10.1.0.50"] and reads == 1,
+        f"_neighbor_tick (BH3): when nothing could be sent the table is not read again and the device takes no miss - 1.2.6 to 1.2.8 called it offline here (got {moved}, {reads} reads, {len(statements)} statements)",
     )
     moved, _statements, probed, reads = neighbor_pass([reachable], lease)
     check(
@@ -1198,8 +1198,8 @@ def main():
         "investigation_card: an admin sees the enabled sinks' names",
     )
     check(
-        {"label": "Published to", "value": "no enabled sink"} in p.investigation_card(tracked_on, [])["rows"],
-        "investigation_card: no enabled sink reads as such",
+        {"label": "Published to", "value": "no enabled destination"} in p.investigation_card(tracked_on, [])["rows"],
+        "investigation_card: no enabled destination reads as such (1.2.9: the word a person reads for a sink)",
     )
     subject = types.SimpleNamespace(mac="AA:BB:CC:DD:EE:01")
     p._current_subnet_for_mac = lambda mac: 1
@@ -2027,9 +2027,9 @@ def main():
     silent._current_ip_hostname_bulk = lambda macs, strict=False: {mac: (mac, "") for mac in macs}
     silent._send_probes = lambda addresses: 0
     check(
-        silent._confirmed_by_probe("ip", pool[:100]) == (set(), set())
+        silent._confirmed_by_probe("ip", pool[:100]) == (set(), set(pool[:100]))
         and silent._probe_rotation == {"pass": 1, "asked": {}},
-        f"_confirmed_by_probe (BG4): when _send_probes answers 0 the pass is counted and no address is stamped (got {silent._probe_rotation['pass']}, {len(silent._probe_rotation['asked'])} stamped)",
+        f"_confirmed_by_probe (BG4, BH3): when _send_probes answers 0 the pass is counted, no address is stamped and all 100 wait (got {silent._probe_rotation['pass']}, {len(silent._probe_rotation['asked'])} stamped)",
     )
     _batches, _longest, r = rotation_world(lambda number: pool[:100], 2)
     check(
@@ -2059,6 +2059,205 @@ def main():
         and not any(ip in kept for ip in old_addresses[:64])
         and all(ip in kept for ip in old_addresses[64:]),
         f"_confirmed_by_probe (BG4): the map of asked addresses is kept to 4096, the 64 asked longest ago dropped for the 64 just asked (got {len(kept)})",
+    )
+
+    # ── 1.2.9 (BH3): a probe that could not be sent, or whose answer could not be read, asked nobody ───────────────
+    def probe_world(count, failure, passes=3, absent=(), shown=(), gone=()):
+        """The real `_neighbor_tick`, `_confirmed_by_probe`, `probe_batch` and `_current_ip_hostname_bulk`, `passes` times, over `count`
+        devices recorded online. Each holds a lease (but the ones in `absent`) and answers when it is asked (but the ones in `gone`);
+        the ones in `shown` are REACHABLE on the first read already. `failure(n)` is what goes wrong on pass n: "send" (the sender
+        answers 0), "raise" (the neighbor read after the probe raises), "rc" (it exits non-zero) or None. Only the databases, the
+        sender, the wait and `ip neigh` are stood in. Returns (transitions, the state store, the devices)."""
+        w = load_plugin()
+        devices = {
+            f"aa:bb:cc:dd:{n // 256:02x}:{n % 256:02x}": f"10.1.{n // 250}.{n % 250 + 1}" for n in range(1, count + 1)
+        }
+        moved = []
+        store = _StateDB(devices)
+        now = {"pass": 0, "reads": 0, "asked": set()}
+
+        def _table(asked):
+            return "".join(
+                f"{ip} dev eth0 lladdr {mac} {'REACHABLE' if mac in shown or (ip in asked and mac not in gone) else 'STALE'}\n"
+                for mac, ip in devices.items()
+            )
+
+        def _run(*a, **k):
+            now["reads"] += 1
+            if now["reads"] == 1:
+                return types.SimpleNamespace(returncode=0, stdout=_table(set()))
+            if failure(now["pass"]) == "raise":
+                raise OSError("ip neigh did not run")
+            if failure(now["pass"]) == "rc":
+                return types.SimpleNamespace(returncode=1, stdout="")
+            return types.SimpleNamespace(returncode=0, stdout=_table(now["asked"]))
+
+        def _send(addresses):
+            now["asked"] = set(addresses)
+            return 0 if failure(now["pass"]) == "send" else len(addresses)
+
+        def _transition(mac, online):
+            moved.append((mac, online))
+            store.state[mac].update(online=1 if online else 0, misses=0)
+
+        w._tracked_macs = lambda: set(devices)
+        w._ip_binary = lambda: "ip"
+        w._local_networks = lambda ip_bin: nets
+        w._local_macs = lambda tracked, local_nets: set(tracked)
+        w._get_kea_db = lambda: _KeaDB(
+            [
+                {"mac_hex": mac.replace(":", "").upper(), "ip": ip, "hostname": ""}
+                for mac, ip in devices.items()
+                if mac not in absent
+            ]
+        )
+        w._send_probes = _send
+        w._PROBE_WAIT_S = 0
+        w.subprocess = types.SimpleNamespace(run=_run, TimeoutExpired=Exception)
+        w._get_db = lambda: store
+        w._apply_transition = _transition
+        for number in range(1, passes + 1):
+            now.update({"pass": number, "reads": 0, "asked": set()})
+            w._neighbor_tick()
+        return moved, store, devices
+
+    for failure, what in (
+        ("send", "the probe could not be sent"),
+        ("raise", "the neighbor read after the probe raised"),
+        ("rc", "the neighbor read after the probe failed"),
+    ):
+        moved, store, _devices = probe_world(100, lambda number, failure=failure: failure)
+        check(
+            moved == [] and store.writes == [] and all(row["misses"] == 0 for row in store.state.values()),
+            f"_neighbor_tick (BH3): {what} on three passes - none of 100 present devices with a lease is called offline, none takes a miss "
+            f"and nothing is written, the 36 past the batch included (got {len(moved)} offline, {len(store.writes)} writes; 1.2.8: 100 offline)",
+        )
+    first_mac, last_mac = "aa:bb:cc:dd:00:01", "aa:bb:cc:dd:00:0a"
+    moved, store, _devices = probe_world(10, lambda number: "send", passes=1, absent={last_mac}, shown={first_mac})
+    check(
+        moved == [] and store.writes == [("seen", first_mac)] and store.state[last_mac]["misses"] == 0,
+        f"_neighbor_tick (BH3): with the probe unsendable, a device the first read shows is still marked seen, and a device with no lease "
+        f"waits like the rest (got {store.writes})",
+    )
+    moved, store, _devices = probe_world(10, lambda number: None, passes=1, absent={last_mac})
+    check(
+        moved == [] and [mac for mac, row in store.state.items() if row["misses"]] == [last_mac],
+        "_neighbor_tick (BH3): when the probe was sent and its answer read, the device with no lease is a miss as before",
+    )
+    moved, store, _devices = probe_world(
+        100, lambda number: "rc" if number <= 3 else None, passes=3 + 6, gone={"aa:bb:cc:dd:00:64"}
+    )
+    check(
+        moved == [("aa:bb:cc:dd:00:64", False)],
+        f"_neighbor_tick (BH3): a device that left while the answer could not be read is called offline once it can be, at its third "
+        f"miss of its own, and nobody else is (got {moved})",
+    )
+    stamped = load_plugin()
+    stamped._current_ip_hostname_bulk = lambda macs, strict=False: {mac: (mac, "") for mac in macs}
+    stamped._send_probes = lambda addresses: 1  # one datagram of the 64 went out
+    stamped._PROBE_WAIT_S = 0
+    stamped.subprocess = types.SimpleNamespace(run=lambda *a, **k: _NoTable(), TimeoutExpired=Exception)
+    answer = stamped._confirmed_by_probe("ip", pool[:100])
+    check(
+        answer == (set(), set(pool[:100]))
+        and stamped._probe_rotation["asked"] == dict.fromkeys(pool[:64], 1)
+        and stamped._probe_rotation["pass"] == 1,
+        "_confirmed_by_probe (BH3, BH6): when the read after the probe fails all 100 wait, and the 64 of the batch are stamped as "
+        "asked although one datagram of the batch was sent - the stamping is as it was in 1.2.8",
+    )
+    check(
+        "every device is a miss" not in (stamped._confirmed_by_probe.__doc__ or "")
+        and "v1.2.9 (BH3)" in (stamped._confirmed_by_probe.__doc__ or ""),
+        "_confirmed_by_probe (BH3): its docstring no longer says every device is a miss when nothing could be sent",
+    )
+
+    # ── 1.2.9: the page (V52, addition 11 of the look over 7.2.0-beta.5) ───────────────────────────────────────────
+    page = pathlib.Path(ROOT, "templates", "presence", "index.html").read_text(encoding="utf-8")
+    source = pathlib.Path(ROOT, "plugin.py").read_text(encoding="utf-8")
+    check(
+        page.count("Track Device") == 5 and "Track a device</" not in page and ">Track</button>" not in page,
+        f"index.html: the button is 'Track Device' in the header, the first steps and the dialog (got {page.count('Track Device')})",
+    )
+    check(
+        page.count("Add Destination") == 4
+        and "Publish To</h2>" in page
+        and not re.search(r"\bSinks?\b", re.sub(r"\{#.*?#\}", "", page, flags=re.S)),
+        f"index.html: the section is 'Publish To', its button 'Add Destination', and the page does not say Sink (got {page.count('Add Destination')})",
+    )
+    head = page[
+        page.index('<div class="card-header pr-card-head">') : page.index('<p class="small muted pr-card-note">')
+    ]
+    check(
+        'id="pr-add-sink-btn"' in head and page.count('id="pr-add-sink-btn"') == 1 and "<table" not in head,
+        "index.html: Add Destination sits in the Publish To card's header, before its table, and nowhere else",
+    )
+    note = page[page.index('<p class="small muted pr-card-note">') : page.index('<p class="muted pr-empty">')]
+    check(
+        "(Home Assistant, an MQTT broker or an HTTP address); with no destination the state is still recorded and shown on "
+        "this page, and nothing is sent.{% if"
+        in note
+        and note.split("{% if")[0].count(". ") == 0,
+        "index.html: one sentence under Publish To says what a destination is and what happens with none",
+    )
+    first_run = page[
+        page.index('<div class="card first-run">') : page.index('{% else %}\n<div class="card pr-card-flush">')
+    ]
+    check(
+        page.index("{% if not rows %}\n{# v1.2.9") < page.index('<div class="card first-run">')
+        and "<h3>Getting started</h3>" in first_run
+        and first_run.count("<ol>") == 1
+        and "No devices tracked yet" not in page,
+        "index.html: with nothing tracked the page shows the card of first steps in place of the empty table",
+    )
+    check(
+        first_run.count("<li>") == 4
+        and first_run.count("{% if is_superadmin %}") == 1
+        and first_run.count("{% elif is_admin %}") == 1
+        and "/settings/alerts" not in page
+        and "register_alert" not in source,
+        "index.html: two steps for each role (one of three first steps, then what Jen does), and no alert step: Presence registers no alert type",
+    )
+    superadmin_step = first_run[first_run.index("{% if is_superadmin %}") : first_run.index("{% elif is_admin %}")]
+    check(
+        superadmin_step.index("Add a destination first") < superadmin_step.index("Then track a device")
+        and 'data-pr-open="pr-add-sink-modal"' in superadmin_step
+        and 'data-pr-open="pr-add-modal"' in superadmin_step,
+        "index.html: the first step names the destination before the device, each with its button",
+    )
+    check(
+        "querySelectorAll('[data-pr-open]')" in page
+        and page.count('data-pr-open="pr-add-modal"') == 3
+        and page.count('data-pr-open="pr-add-sink-modal"') == 2
+        and "getElementById('pr-add-btn')" not in page
+        and "getElementById('pr-add-sink-btn')" not in page,
+        "index.html: every button that opens a dialog is bound through data-pr-open, so a button that is not drawn breaks no script",
+    )
+    check(
+        'data-m="full"' not in page and '<p class="muted pr-empty">No destination yet.</p>' in page,
+        "index.html: no empty table row is left on the page (its text sat high on a phone); the empty Publish To card is a centered line",
+    )
+    check(
+        "Send Test</button>" in page and "Send test" not in page,
+        "index.html: 'Send Test' is title case like the page's every button",
+    )
+    check(
+        "@media screen and (max-width: 768px)" in page and not re.search(r"@media\s*\((?:max|min)-width", page),
+        "index.html: the page's width rule names screen",
+    )
+    flashes = [re.sub(r"\{[^}]*\}?", "", text) for text in re.findall(r'flash\(\s*f?"([^"]*)"', source)]
+    check(
+        not [text for text in flashes if re.search(r"\bsinks?\b", text, re.I)]
+        and 'flash("Destination enabled." if new_enabled else "Destination paused.", "success")' in source
+        and source.count('flash("Destination not found.", "error")') == 2,
+        f"plugin.py: no flash sentence says sink - a person reads destination ({len(flashes)} flash sentences read)",
+    )
+    p.is_superadmin = lambda: False
+    refused = []
+    p.flash = lambda message, category="message": refused.append((message, category))
+    check(
+        p._require_superadmin() is False
+        and refused == [("Destinations are global integration settings: only a superadmin can change them.", "error")],
+        f"_require_superadmin: an admin who is not a superadmin is told destinations are a superadmin's (got {refused})",
     )
 
     if failures:

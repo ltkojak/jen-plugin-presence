@@ -12,6 +12,22 @@
 .pr-dialog-track{width:min(440px,94vw)}
 .pr-dialog-sink{width:min(460px,94vw)}
 .pr-hidden{display:none}
+/* v1.2.9 - the Publish To card: its heading and its add button in one header row, one sentence under it */
+.pr-card-head{padding:16px 20px 0;margin-bottom:6px}
+.pr-card-note{padding:0 20px;margin-bottom:14px}
+.pr-empty{padding:20px;text-align:center}
+@media screen and (max-width: 768px){
+.pr-card-head{padding:14px 14px 0}
+.pr-card-note{padding:0 14px}
+}
+{% if not rows %}
+/* v1.2.9 - the card of first steps, shown in place of an empty table */
+.first-run h3{font-size:15px;margin-bottom:12px}
+.first-run ol{padding-left:22px}
+.first-run li{margin-bottom:10px;line-height:1.6}
+.first-run li:last-child{margin-bottom:0}
+.first-run .btn{margin-left:8px}
+{% endif %}
 </style>
 
 <div class="page-header flex items-center between wrap gap-3">
@@ -20,7 +36,7 @@
         <p>Publishes tracked devices' online/offline state to Home Assistant, MQTT, or any HTTP endpoint.</p>
     </div>
     {% if is_admin %}
-    <button id="pr-add-btn" class="btn btn-primary">{{ icon("plus") }} Track a device</button>
+    <button type="button" id="pr-add-btn" class="btn btn-primary" data-pr-open="pr-add-modal">{{ icon("plus") }} Track Device</button>
     {% endif %}
 </div>
 
@@ -28,6 +44,27 @@
 <div class="alert alert-info">{{ icon("info") }} Presence tracks IPv4-identified devices only.</div>
 {% endif %}
 
+{% if not rows %}
+{# v1.2.9 - nothing tracked yet: the first steps, in place of an empty table #}
+<div class="card first-run">
+    <h3>Getting started</h3>
+    <ol>
+        {% if is_superadmin %}
+        <li>Add a destination first, if the state should go to Home Assistant, an MQTT broker or an HTTP address: a destination is sent only the changes that happen after it was added.
+            <button type="button" class="btn btn-sm btn-secondary" data-pr-open="pr-add-sink-modal">{{ icon("plus") }} Add Destination</button>
+            Then track a device here, or use "Track presence" on any Lease or Device row.
+            <button type="button" class="btn btn-sm btn-primary" data-pr-open="pr-add-modal">{{ icon("plus") }} Track Device</button></li>
+        {% elif is_admin %}
+        <li>Track a device here, or use "Track presence" on any Lease or Device row.
+            <button type="button" class="btn btn-sm btn-primary" data-pr-open="pr-add-modal">{{ icon("plus") }} Track Device</button>
+            A superadmin adds the destinations under Publish To, and a destination is sent only the changes that happen after it was added.</li>
+        {% else %}
+        <li>Track a device. <span class="muted">Tracking a device needs an admin.</span></li>
+        {% endif %}
+        <li>Jen then watches each tracked device's DHCP lease and, on the networks the Jen host is attached to, checks every five minutes whether the device still answers; each change between online and offline is sent to every destination that is not paused.</li>
+    </ol>
+</div>
+{% else %}
 <div class="card pr-card-flush">
 <div class="table-wrap">
 <table class="rowlist">
@@ -73,23 +110,29 @@
         </td>
     </tr>
     {% endfor %}
-    {% if not rows %}
-    <tr><td data-m="full" colspan="4" class="center muted">No devices tracked yet. {% if is_admin %}Track one above, or use "Track presence" on any Lease or Device row.{% endif %}</td></tr>
-    {% endif %}
     </tbody>
 </table>
 </div>
 </div>
+{% endif %}
 
 {% if is_admin %}
-<div class="page-header mt-3">
-    <h2>Sinks</h2>
-</div>
+{# v1.2.9 - "Sinks" is now "Publish To": the heading and the add button share the card's header, and one sentence says what a destination is #}
 <div class="card pr-card-flush">
+<div class="card-header pr-card-head">
+    <h2 class="card-title">Publish To</h2>
+    {% if is_superadmin %}
+    <button type="button" id="pr-add-sink-btn" class="btn btn-sm btn-secondary" data-pr-open="pr-add-sink-modal">{{ icon("plus") }} Add Destination</button>
+    {% endif %}
+</div>
+<p class="small muted pr-card-note">Each tracked device's online or offline state is sent to every destination here that is not paused (Home Assistant, an MQTT broker or an HTTP address); with no destination the state is still recorded and shown on this page, and nothing is sent.{% if not is_superadmin %} A destination receives every tracked device's state, so only a superadmin can add, change or remove one.{% endif %}</p>
+{% if not sinks %}
+<p class="muted pr-empty">No destination yet.</p>
+{% else %}
 <div class="table-wrap">
 <table class="rowlist">
     <thead><tr>
-        <th>Sink</th>
+        <th>Destination</th>
         <th>Type</th>
         <th></th>
     </tr></thead>
@@ -107,7 +150,7 @@
             <div class="flex gap-1 items-center">
                 <form method="POST" action="{{ url_for('presence.test_sink', sink_id=s.id) }}" class="contents">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit" class="btn btn-sm btn-secondary" title="Send test">Send test</button>
+                    <button type="submit" class="btn btn-sm btn-secondary" title="Send a test message">Send Test</button>
                 </form>
                 <form method="POST" action="{{ url_for('presence.toggle_sink', sink_id=s.id) }}" class="contents">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -123,27 +166,18 @@
         </td>
     </tr>
     {% endfor %}
-    {% if not sinks %}
-    <tr><td data-m="full" colspan="3" class="center muted">No sinks configured yet.</td></tr>
-    {% endif %}
     </tbody>
 </table>
 </div>
-</div>
-{% if is_superadmin %}
-<div class="mt-2">
-    <button id="pr-add-sink-btn" class="btn btn-secondary">{{ icon("plus") }} Add Sink</button>
-</div>
-{% else %}
-<p class="small muted mt-2">Sinks receive every tracked device's state, so only a superadmin can add, change or remove one.</p>
 {% endif %}
+</div>
 {% endif %}
 
 {% if is_admin %}
 <div id="pr-add-modal" class="pr-modal">
 <div class="card pr-dialog pr-dialog-track">
     <div class="flex between items-center mb-3">
-        <h3>{{ icon("plus") }} Track a device</h3>
+        <h3>{{ icon("plus") }} Track Device</h3>
         <button id="pr-add-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
     </div>
     <form method="POST" action="{{ url_for('presence.track') }}" id="pr-add-form">
@@ -162,7 +196,7 @@
             <input type="text" name="label" id="pr-label" maxlength="100" autocomplete="off">
         </div>
         <div class="flex gap-2 mt-3">
-            <button type="submit" class="btn btn-primary">Track</button>
+            <button type="submit" class="btn btn-primary">Track Device</button>
             <button type="button" id="pr-add-cancel-btn" class="btn btn-secondary">Cancel</button>
         </div>
     </form>
@@ -174,7 +208,7 @@
 <div id="pr-add-sink-modal" class="pr-modal">
 <div class="card pr-dialog pr-dialog-sink">
     <div class="flex between items-center mb-3">
-        <h3>{{ icon("plus") }} Add Sink</h3>
+        <h3>{{ icon("plus") }} Add Destination</h3>
         <button id="pr-add-sink-close-btn" class="btn btn-sm btn-secondary" aria-label="Close">{{ icon("x") }}</button>
     </div>
     <form method="POST" action="{{ url_for('presence.add_sink') }}" id="pr-add-sink-form">
@@ -208,7 +242,7 @@
             <label class="flex items-center gap-1"><input type="checkbox" name="discovery"> Send Home Assistant MQTT discovery messages</label>
         </div>
         <div class="flex gap-2 mt-3">
-            <button type="submit" class="btn btn-primary">Add Sink</button>
+            <button type="submit" class="btn btn-primary">Add Destination</button>
             <button type="button" id="pr-add-sink-cancel-btn" class="btn btn-secondary">Cancel</button>
         </div>
     </form>
@@ -222,7 +256,10 @@ function _prModal(id, show) {
 }
 {% if is_admin %}
 var PR_CANDIDATES = {{ candidates|tojson }};
-document.getElementById('pr-add-btn').addEventListener('click', function() { _prModal('pr-add-modal', true); });
+// v1.2.9 - every button that opens a dialog names it in data-pr-open (the header's, the Publish To card's, the first steps')
+document.querySelectorAll('[data-pr-open]').forEach(function(btn) {
+    btn.addEventListener('click', function() { _prModal(btn.getAttribute('data-pr-open'), true); });
+});
 document.getElementById('pr-add-close-btn').addEventListener('click', function() { _prModal('pr-add-modal', false); });
 document.getElementById('pr-add-cancel-btn').addEventListener('click', function() { _prModal('pr-add-modal', false); });
 document.getElementById('pr-add-modal').addEventListener('click', function(e) { if (e.target === this) _prModal('pr-add-modal', false); });
@@ -235,7 +272,6 @@ document.getElementById('pr-mac').addEventListener('input', function() {
 
 {% endif %}
 {% if is_superadmin %}
-document.getElementById('pr-add-sink-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', true); });
 document.getElementById('pr-add-sink-close-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', false); });
 document.getElementById('pr-add-sink-cancel-btn').addEventListener('click', function() { _prModal('pr-add-sink-modal', false); });
 document.getElementById('pr-add-sink-modal').addEventListener('click', function(e) { if (e.target === this) _prModal('pr-add-sink-modal', false); });

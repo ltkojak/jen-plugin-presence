@@ -1,5 +1,31 @@
 # Presence Plugin — Changelog
 
+## [1.2.9] - 2026-11-22
+
+One fix, one correction to the notes and the page, from the executing pass on Jen 7.2.0-beta.5 (BH3, BH6) and the look over its pages (V52 and addition 11 of that review). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.
+
+### Fixed: when the probe could not be sent, or its answer could not be read, every device on the Jen host's network was called offline (BH3)
+
+A tracked device the neighbor table does not show is asked: Jen sends one datagram to the address of its lease, waits, and reads the table again. When no datagram could be sent (the socket could not be opened, or every send was refused), or when that second read of the table failed, the pass answered "nobody confirmed". Every unseen device took a miss, the devices past the 64 of the batch included, which had not been asked at all, and after three such passes, fifteen minutes, every one of them was published offline. In the executing pass that was 100 of 100 present devices with a lease, in each of the two failures, on 1.2.8 and on 1.2.7.
+
+A question that could not be put, or whose answer could not be read, is now told apart from a question nobody answered. On such a pass Jen logs one warning and counts no miss for any unseen device: their state and their miss counts stay as they are, as they do since 1.2.8 when the lease lookup fails. A device the first read of the table already shows is still marked seen on that pass. Once the probe works again a device that has left is asked, and is called offline at its third miss, as before. When the probe was sent and its answer was read, a device that holds no lease is a miss, as before.
+
+### Correction to the notes of 1.2.8 (BH6)
+
+The notes of 1.2.8 say "An address is marked as asked only when the datagrams could be sent". That is not what the code does, in 1.2.8 or now: the addresses of a batch are marked as asked when at least one datagram of that batch was sent. A batch of which nothing could be sent marks nobody, so that pass uses up nobody's turn; a batch of which one datagram went out marks all of its addresses. The marking is not changed in 1.2.9.
+
+### The page: Track Device, Publish To, and first steps in place of an empty table (V52, addition 11)
+
+The header button "Track a device" is now "Track Device", and so are the dialog and its button: every button on the page is title case, verb then noun ("Send test" is "Send Test").
+
+The section "Sinks" never said what a sink is, and its button sat under its table at the left. It is now a card headed "Publish To" with "Add Destination" in the card's header at the right and one sentence under the heading: each tracked device's online or offline state is sent to every destination that is not paused (Home Assistant, an MQTT broker or an HTTP address), and with no destination the state is still recorded and shown on the page, and nothing is sent. The messages say destination too: "Destination enabled.", "Destination paused.", "Destination removed.", "Destination not found.", "Pick a supported destination type.", "Could not add the destination; the details are in Jen's log." and its two siblings for update and remove, "Destinations are global integration settings: only a superadmin can change them.", and the Investigation card's "no enabled destination". Only the words a person reads changed: the routes (`/management/presence/sinks/...`), the `pr_sinks` table, the audit actions (`PRESENCE_DELETE_SINK`) and the log lines keep the word sink.
+
+With nothing tracked the page showed an empty table with one line of text, which on a phone sat high in its row. It now shows a "Getting started" card in its place, with two steps. The first is to add a destination and then track a device, in that order: a destination is sent only the changes that happen after it was added, so a device tracked first has its first state recorded and sent nowhere. Each has its button in the step; an admin who is not a superadmin gets the device step and is told who adds destinations, and a viewer is told that tracking needs an admin. The second step says what Jen then does by itself: it watches each tracked device's DHCP lease and, on the networks the Jen host is attached to, checks every five minutes whether the device still answers, and sends each change to every destination that is not paused. Presence registers no alert type, so there is no third step. An empty Publish To card says "No destination yet." in one centered line and draws no table.
+
+### The harness
+
+`tools/test_plugin.py` runs the real pass with the real lease lookup over 100 present devices with a lease, with the sender answering 0, with the read after the probe raising and with it exiting non-zero, three passes each: no device is called offline, none takes a miss and nothing is written (1.2.8: 100 offline, 200 writes). It checks that a device the first read shows is still marked seen, that a device with no lease waits with the rest on such a pass and is a miss on a pass that worked, that a device that left is called offline three passes after the answer can be read again, and that the marking of a batch is as it was. The 1.2.6 check "when nothing could be sent the miss counts" now asserts the opposite. The page checks read the template: the labels, the Publish To header with its button before the table, the two steps for each role, and that no empty table row is left.
+
 ## [1.2.8] - 2026-11-21
 
 Two fixes, from the executing pass on Jen 7.2.0-beta.4 (BG2, BG4). `requires_jen` (5.68.0) and `plugin_api` (3) are unchanged. No migration.
